@@ -1,0 +1,1416 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum DisciplineDayStatus {
+  SUCCESS
+  PARTIAL
+  FAILED
+  EMPTY
+}
+
+enum DisciplineRuleSystemKey {
+  MAX_DAILY_LOSS
+  MAX_TRADE_LOSS
+}
+
+enum DisciplineRuleLimitUnit {
+  AMOUNT
+}
+
+enum UserRole {
+  USER
+  ADMIN
+}
+
+enum UserPlan {
+  FREE
+  PRO
+  BUSINESS
+}
+
+model User {
+  id                     String                  @id @default(cuid())
+  email                  String                  @unique
+  password               String?
+  provider               String?                 @default("credentials")
+  name                   String?
+  emailVerified          DateTime?
+  image                  String?
+  role                   UserRole                @default(USER)
+  plan                   UserPlan                @default(FREE)
+  completedTours         String[]                @default([])
+  trackerOnboardedAt     DateTime?
+  createdAt              DateTime                @default(now())
+  updatedAt              DateTime                @updatedAt
+  trades                 Trade[]
+  accounts               Account[]
+  sessions               Session[]
+  tradingAccounts        TradingAccount[]
+  accountCashFlows       AccountCashFlow[]
+  tradingSessions        TradingSession[]
+  backtests              Backtest[]
+  backtestTrades         BacktestTrade[]
+  biasTools              BiasTool[]
+  poiTools               PoiTool[]
+  itfTools               ItfConfirmationTool[]
+  entryModelTools        EntryModelTool[]
+  entryTimeframeTools    EntryTimeframeTool[]
+  ftaTools               FtaTool[]
+  targetTools            TargetTool[]
+  tablePreferences       UserTablePreference[]
+  tradeErrors            TradeError[]
+  analytics              Analytics[]
+  feedbacks              Feedback[]
+  scheduledNotifications ScheduledNotification[]
+  tradingJournals        TradingJournal[]
+  tradingSetups          TradingSetup[]
+  setupNotes             SetupNote[]
+  setupScreenshots       SetupScreenshot[]
+  setupSharesOwned       SetupShare[]            @relation("SetupShareOwner")
+  analyticsNotes         AnalyticsNote[]
+  mistakeTemplates       MistakeTemplate[]
+  userMistakeTypes       UserMistakeType[]
+  ruleSets               RuleSet[]
+  achievements           UserAchievement[]
+  emailCampaigns         UserEmailCampaign[]
+  dashboards             Dashboard[]
+  disciplineRules        DisciplineRule[]
+  disciplineDays         DisciplineDay[]
+  traderDemons           TraderDemon[]
+  demonDays              DemonDay[]
+  demonOccurrences       DemonOccurrence[]
+  noteTemplates          NoteTemplate[]
+  noteTemplateDefaults   UserNoteTemplateDefault[]
+  preferredLocale        String? // 'uk' | 'en' - для майбутнього зберігання мови користувача
+  lastLogin              DateTime?
+  lastActiveAt           DateTime?
+  passwordChangedAt      DateTime? // sessions issued before this are revoked (see session-revocation)
+  marketingUnsubscribedAt DateTime?
+  marketingBouncedAt      DateTime?
+  utmSource              String? // first-touch acquisition attribution (captured on landing)
+  utmMedium              String?
+  utmCampaign            String?
+  utmContent             String?
+  utmTerm                String?
+  signupEventAt          DateTime? // when the GA4 sign_up conversion was recorded (dedupes OAuth redirect)
+  firstTradeEventAt      DateTime? // when the GA4 first_trade conversion was recorded (dedupes across all trade-entry paths)
+  phone                  String?
+  telegram               String?
+  yearsTrading           Int?
+  propFirm               String?
+  bio                    String?
+  storageBytesUsed       BigInt                  @default(0)
+  blobObjects            BlobObject[]
+  eaToken                EaToken?
+  pendingMt5Accounts     PendingMt5Account[]
+  terminalImportFailures TerminalImportFailure[]
+  aiResponseFeedback     AiResponseFeedback[]
+  activityEvents         UserActivityEvent[]
+}
+
+model UserActivityEvent {
+  id        String   @id @default(cuid())
+  userId    String
+  // Free-form activity type so custom kinds can be recorded without a migration.
+  type      String   @default("APP_ACTIVITY")
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([createdAt])
+  @@index([userId, createdAt])
+  @@index([type, createdAt])
+}
+
+model BlobObject {
+  id         String   @id @default(cuid())
+  userId     String
+  url        String   @unique
+  pathname   String
+  bytes      Int
+  feature    String
+  entityType String
+  entityId   String
+  kind       String
+  createdAt  DateTime @default(now())
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([entityType, entityId])
+}
+
+model PlanQuota {
+  plan         UserPlan @id
+  storageBytes BigInt
+  updatedAt    DateTime @updatedAt
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  email     String
+  token     String   @unique
+  expires   DateTime
+  createdAt DateTime @default(now())
+
+  @@index([email])
+}
+
+model EmailVerificationCode {
+  id        String   @id @default(cuid())
+  email     String
+  code      String
+  expires   DateTime
+  attempts  Int      @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([email])
+}
+
+model AutoSignInToken {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  expires   DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+model TradingAccount {
+  id                      String               @id @default(cuid())
+  name                    String
+  propCompanyName         String?
+  stage                   String?              @default("demo")
+  goal                    Float?
+  maxDrawdown             Float?
+  nominal                 Float
+  currency                String               @default("USD") @db.VarChar(10)
+  openedAt                DateTime?
+  isArchived              Boolean              @default(false)
+  userId                  String
+  user                    User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  trades                  Trade[]
+  cashFlows               AccountCashFlow[]
+  /** which terminal the user uses for this account (mt5 | tradelocker | ctrader | custom name); for display and add-trades flow */
+  preferredTerminal       String?
+  terminalType            String?
+  terminalAccountId       String?
+  terminalAccNum          String?
+  terminalServer          String?
+  terminalEnvironment     String?
+  terminalConnectedAt     DateTime?
+  /** 'deactivated' when TradeLocker auth/account no longer valid (e.g. prop company disabled demo); null = active */
+  terminalIntegrationStatus String?
+  lastSyncAt              DateTime?
+  autoSyncEnabled         Boolean              @default(false)
+  autoSyncIntervalMinutes Int?                 @default(15)
+  bridgeConnectedAt       DateTime?
+  syncRequestedAt         DateTime?
+  terminalSyncState       Json?
+  terminalCredentials     TerminalCredentials?
+  mt5Token                Mt5Token?
+  ctraderToken            CtraderToken?
+  terminalImportFailures  TerminalImportFailure[]
+  createdAt               DateTime             @default(now())
+  updatedAt               DateTime             @updatedAt
+
+  @@index([userId])
+  @@index([isArchived])
+}
+
+/// Manual capital movements on an account (deposits / withdrawals) that change the
+/// balance without being trade P&L. `amount` is always stored positive; the sign is
+/// derived from `type`. `occurredAt` dates each movement so it lands on the right
+/// point of the equity curve.
+model AccountCashFlow {
+  id               String         @id @default(cuid())
+  tradingAccountId String
+  tradingAccount   TradingAccount @relation(fields: [tradingAccountId], references: [id], onDelete: Cascade)
+  userId           String
+  user             User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /** 'deposit' | 'withdrawal' */
+  type             String
+  amount           Float
+  occurredAt       DateTime
+  note             String?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  @@index([tradingAccountId])
+  @@index([userId])
+}
+
+model TerminalCredentials {
+  id                 String         @id @default(cuid())
+  tradingAccountId   String         @unique
+  tradingAccount     TradingAccount @relation(fields: [tradingAccountId], references: [id], onDelete: Cascade)
+  email              String         @db.Text
+  encryptedPassword  String         @db.Text
+  accessToken        String?        @db.Text
+  refreshToken       String?        @db.Text
+  /** API key for HMAC-based integrations (e.g. Bybit). Encrypted with same scheme as encryptedPassword. */
+  encryptedApiKey    String?        @db.Text
+  /** API secret for HMAC-based integrations (e.g. Bybit). Encrypted. */
+  encryptedApiSecret String?        @db.Text
+  expiresAt          DateTime?
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+}
+
+model TradingSession {
+  id             String          @id @default(cuid())
+  name           String
+  openTime       String
+  closeTime      String
+  region         String?
+  icon           String?
+  isDefault      Boolean         @default(false)
+  userId         String
+  user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  trades         Trade[]
+  backtestTrades BacktestTrade[]
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  @@index([userId])
+}
+
+model Trade {
+  id                    String                     @id @default(cuid())
+  symbol                String
+  type                  String
+  quantity              Float
+  entryDate             DateTime
+  exitDate              DateTime?
+  profit                Float?
+  profitPercentage      Float?
+  pnl                   Float?
+  notes                 String?                    @db.Text
+  analysisNotes         String?                    @db.Text
+  tags                  String[]
+  userId                String
+  user                  User                       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tradingAccountId      String?
+  tradingAccount        TradingAccount?            @relation(fields: [tradingAccountId], references: [id], onDelete: Cascade)
+  tradingSessionId      String?
+  tradingSession        TradingSession?            @relation(fields: [tradingSessionId], references: [id], onDelete: SetNull)
+  riskPercentage        Float?
+  rr                    Float?                     @map("expectedRR")
+  result                String?
+  followedPlan          Boolean?                   @default(false)
+  bestTrade             Boolean?                   @default(false)
+  bias                  String?
+  poi                   String?
+  itfConfirmation       String?
+  entryModel            String?
+  entryTimeframe        String?
+  fta                   String?
+  target                String?
+  fromTerminal          Boolean                    @default(false)
+  terminalTradeId       String?
+  terminalName          String?
+  /** Open-side commission/fee from broker (e.g. Bybit openFee). Hidden in UI for now. */
+  openFee               Float?
+  /** Close-side commission/fee from broker (e.g. Bybit closeFee). Hidden in UI for now. */
+  closeFee              Float?
+  /** Total commission (open+close combined) from terminals that report it as one number (e.g. TradeLocker). In account currency. */
+  commission            Float?
+  /** Swap/rollover charges from terminal. In account currency. */
+  swap                  Float?
+  /** Gross PnL before commission/swap (TradeLocker `profit`). pnl = grossProfit + commission + swap. */
+  grossProfit           Float?
+  /** Position leverage as reported by broker (e.g. Bybit leverage). Hidden in UI for now. */
+  leverage              Float?
+  biasToolId            String?
+  biasTool              BiasTool?                  @relation(fields: [biasToolId], references: [id], onDelete: SetNull)
+  biasTools             TradeBiasTool[]
+  poiToolId             String?
+  poiTool               PoiTool?                   @relation(fields: [poiToolId], references: [id], onDelete: SetNull)
+  poiTools              TradePoiTool[]
+  itfConfirmationToolId String?
+  itfConfirmationTool   ItfConfirmationTool?       @relation(fields: [itfConfirmationToolId], references: [id], onDelete: SetNull)
+  itfConfirmationTools  TradeItfConfirmationTool[]
+  entryModelToolId      String?
+  entryModelTool        EntryModelTool?            @relation(fields: [entryModelToolId], references: [id], onDelete: SetNull)
+  entryModelTools       TradeEntryModelTool[]
+  entryTimeframeToolId  String?
+  entryTimeframeTool    EntryTimeframeTool?        @relation(fields: [entryTimeframeToolId], references: [id], onDelete: SetNull)
+  entryTimeframeTools   TradeEntryTimeframeTool[]
+  ftaToolId             String?
+  ftaTool               FtaTool?                   @relation(fields: [ftaToolId], references: [id], onDelete: SetNull)
+  ftaTools              TradeFtaTool[]
+  targetToolId          String?
+  targetTool            TargetTool?                @relation(fields: [targetToolId], references: [id], onDelete: SetNull)
+  targetTools           TradeTargetTool[]
+  tradingSetupId        String?
+  tradingSetup          TradingSetup?              @relation(fields: [tradingSetupId], references: [id], onDelete: SetNull)
+  ruleSetId             String?
+  ruleSet               RuleSet?                   @relation(fields: [ruleSetId], references: [id], onDelete: SetNull)
+  tradeRuleItems        TradeRuleItem[]
+  isTestTrade           Boolean                    @default(false)
+  createdAt             DateTime                   @default(now())
+  updatedAt             DateTime                   @updatedAt
+  tradeErrors           TradeError[]
+
+  @@index([userId])
+  @@index([userId, symbol])
+  @@index([entryDate])
+  @@index([userId, entryDate]) // composite index for sorted user queries (critical for performance)
+  @@index([userId, tradingAccountId, entryDate]) // multi-account + date-range statistics filtering
+  @@index([tradingAccountId])
+  @@index([tradingSessionId])
+  @@index([biasToolId])
+  @@index([poiToolId])
+  @@index([itfConfirmationToolId])
+  @@index([entryModelToolId])
+  @@index([entryTimeframeToolId])
+  @@index([ftaToolId])
+  @@index([targetToolId])
+  @@index([tradingSetupId])
+  @@index([ruleSetId])
+  @@unique([userId, terminalName, terminalTradeId], name: "userId_terminalName_terminalTradeId")
+}
+
+model RuleSet {
+  id            String           @id @default(cuid())
+  name          String
+  userId        String
+  user          User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sections      RuleSetSection[]
+  items         RuleItem[]
+  trades        Trade[]
+  tradingSetups TradingSetup[]
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+
+  @@unique([userId, name])
+  @@index([userId])
+}
+
+model RuleSetSection {
+  id        String     @id @default(cuid())
+  ruleSetId String
+  ruleSet   RuleSet    @relation(fields: [ruleSetId], references: [id], onDelete: Cascade)
+  name      String
+  sortOrder Int        @default(0)
+  items     RuleItem[]
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  @@unique([ruleSetId, name])
+  @@index([ruleSetId])
+  @@index([ruleSetId, sortOrder])
+}
+
+enum RuleItemShowWhen {
+  ALWAYS
+  WINNER
+  LOSER
+  BREAKEVEN
+}
+
+model RuleItem {
+  id             String           @id @default(cuid())
+  ruleSetId      String
+  ruleSet        RuleSet          @relation(fields: [ruleSetId], references: [id], onDelete: Cascade)
+  sectionId      String
+  section        RuleSetSection   @relation(fields: [sectionId], references: [id], onDelete: Restrict)
+  title          String
+  description    String?          @db.Text
+  showWhen       RuleItemShowWhen @default(ALWAYS)
+  sortOrder      Int              @default(0)
+  createdAt      DateTime         @default(now())
+  tradeRuleItems TradeRuleItem[]
+
+  @@index([ruleSetId])
+  @@index([sectionId])
+  @@index([sectionId, sortOrder])
+}
+
+model TradeRuleItem {
+  tradeId    String
+  ruleItemId String
+  createdAt  DateTime @default(now())
+
+  trade    Trade    @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  ruleItem RuleItem @relation(fields: [ruleItemId], references: [id], onDelete: Cascade)
+
+  @@id([tradeId, ruleItemId])
+  @@index([tradeId])
+  @@index([ruleItemId])
+}
+
+model DisciplineRule {
+  id        String              @id @default(cuid())
+  userId    String
+  user      User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String
+  description String?           @db.Text
+  sortOrder Int                 @default(0)
+  isActive  Boolean             @default(true)
+  /// weekdays when this rule applies; 0=Sunday..6=Saturday; defaults to all days
+  activeWeekdays Int[]          @default([0, 1, 2, 3, 4, 5, 6])
+  /// true for system-seeded library rules, false for user-created custom rules
+  isPredefined Boolean          @default(false)
+  /// built-in automatic rule type; null for manual checklist rules
+  systemKey DisciplineRuleSystemKey?
+  /// when false, rule is hidden from scoring and daily checklist (used for system rules)
+  isEnabled Boolean             @default(true)
+  limitValue Float?
+  limitUnit DisciplineRuleLimitUnit?
+  dayRules  DisciplineDayRule[]
+  createdAt DateTime            @default(now())
+  updatedAt DateTime            @updatedAt
+
+  @@unique([userId, title])
+  @@unique([userId, systemKey])
+  @@index([userId])
+  @@index([userId, isActive])
+  @@index([userId, isActive, isEnabled])
+  @@index([userId, sortOrder])
+}
+
+model DisciplineDay {
+  id             String              @id @default(cuid())
+  userId         String
+  user           User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  date           DateTime            @db.Date
+  completionRate Int                 @default(0)
+  status         DisciplineDayStatus @default(EMPTY)
+  isSkipped      Boolean             @default(false)
+  note           String?             @db.Text
+  dayRules       DisciplineDayRule[]
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+
+  @@unique([userId, date])
+  @@index([userId, date])
+}
+
+model DisciplineDayRule {
+  id          String        @id @default(cuid())
+  dayId       String
+  day         DisciplineDay @relation(fields: [dayId], references: [id], onDelete: Cascade)
+  ruleId      String
+  rule        DisciplineRule @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+  isCompleted Boolean       @default(false)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  @@unique([dayId, ruleId])
+  @@index([dayId])
+  @@index([ruleId])
+}
+
+enum DemonCategory {
+  EMOTIONAL
+  COGNITIVE
+  BEHAVIORAL
+}
+
+model TraderDemon {
+  id          String            @id @default(cuid())
+  userId      String
+  user        User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name        String
+  description String?           @db.Text
+  category    DemonCategory     @default(EMOTIONAL)
+  color       String            @default("#ef4444")
+  isActive    Boolean           @default(true)
+  /// weekdays when this demon is tracked; 0=Sunday..6=Saturday; defaults to all days
+  activeWeekdays Int[]          @default([0, 1, 2, 3, 4, 5, 6])
+  sortOrder   Int               @default(0)
+  occurrences DemonOccurrence[]
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  @@unique([userId, name])
+  @@index([userId])
+  @@index([userId, isActive])
+}
+
+model DemonDay {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  date      DateTime @db.Date
+  isSkipped Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, date])
+  @@index([userId, date])
+}
+
+model DemonOccurrence {
+  id        String      @id @default(cuid())
+  userId    String
+  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  demonId   String
+  demon     TraderDemon @relation(fields: [demonId], references: [id], onDelete: Cascade)
+  date      String
+  severity  Int         @default(1)
+  note      String?     @db.Text
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  @@unique([userId, demonId, date])
+  @@index([userId])
+  @@index([userId, date])
+  @@index([demonId])
+}
+
+model TradeError {
+  id               String           @id @default(cuid())
+  tradeId          String
+  trade            Trade            @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  userId           String
+  user             User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title            String?
+  shortDescription String?
+  category         String?
+  customTypeId     String?
+  customType       UserMistakeType? @relation(fields: [customTypeId], references: [id], onDelete: SetNull)
+  description      String           @db.Text
+  chartDescription String           @db.Text
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  @@index([userId])
+  @@index([tradeId])
+  @@index([customTypeId])
+}
+
+model UserMistakeType {
+  id        String       @id @default(cuid())
+  userId    String
+  user      User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name      String
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+  errors    TradeError[]
+
+  @@unique([userId, name])
+  @@index([userId])
+}
+
+model BiasTool {
+  id             String          @id @default(cuid())
+  name           String
+  description    String?         @db.Text
+  userId         String
+  user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  isDefault      Boolean         @default(false)
+  trades         Trade[]
+  tradeBiasTools TradeBiasTool[]
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  @@index([userId, name])
+}
+
+model PoiTool {
+  id            String         @id @default(cuid())
+  name          String
+  description   String?        @db.Text
+  userId        String
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  isDefault     Boolean        @default(false)
+  trades        Trade[]
+  tradePoiTools TradePoiTool[]
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  @@index([userId, name])
+}
+
+model TradePoiTool {
+  tradeId   String
+  poiToolId String
+  createdAt DateTime @default(now())
+
+  trade   Trade   @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  poiTool PoiTool @relation(fields: [poiToolId], references: [id], onDelete: Cascade)
+
+  @@id([tradeId, poiToolId])
+  @@index([poiToolId])
+  @@index([tradeId])
+}
+
+model TradeBiasTool {
+  tradeId    String
+  biasToolId String
+  createdAt  DateTime @default(now())
+
+  trade    Trade    @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  biasTool BiasTool @relation(fields: [biasToolId], references: [id], onDelete: Cascade)
+
+  @@id([tradeId, biasToolId])
+  @@index([biasToolId])
+  @@index([tradeId])
+}
+
+model TradeItfConfirmationTool {
+  tradeId               String
+  itfConfirmationToolId String
+  createdAt             DateTime @default(now())
+
+  trade               Trade               @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  itfConfirmationTool ItfConfirmationTool @relation(fields: [itfConfirmationToolId], references: [id], onDelete: Cascade)
+
+  @@id([tradeId, itfConfirmationToolId])
+  @@index([itfConfirmationToolId])
+  @@index([tradeId])
+}
+
+model TradeEntryModelTool {
+  tradeId          String
+  entryModelToolId String
+  createdAt        DateTime @default(now())
+
+  trade          Trade          @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  entryModelTool EntryModelTool @relation(fields: [entryModelToolId], references: [id], onDelete: Cascade)
+
+  @@id([tradeId, entryModelToolId])
+  @@index([entryModelToolId])
+  @@index([tradeId])
+}
+
+model TradeEntryTimeframeTool {
+  tradeId              String
+  entryTimeframeToolId String
+  createdAt            DateTime @default(now())
+
+  trade              Trade              @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  entryTimeframeTool EntryTimeframeTool @relation(fields: [entryTimeframeToolId], references: [id], onDelete: Cascade)
+
+  @@id([tradeId, entryTimeframeToolId])
+  @@index([entryTimeframeToolId])
+  @@index([tradeId])
+}
+
+model TradeFtaTool {
+  tradeId   String
+  ftaToolId String
+  createdAt DateTime @default(now())
+
+  trade   Trade   @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  ftaTool FtaTool @relation(fields: [ftaToolId], references: [id], onDelete: Cascade)
+
+  @@id([tradeId, ftaToolId])
+  @@index([ftaToolId])
+  @@index([tradeId])
+}
+
+model TradeTargetTool {
+  tradeId      String
+  targetToolId String
+  createdAt    DateTime @default(now())
+
+  trade      Trade      @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  targetTool TargetTool @relation(fields: [targetToolId], references: [id], onDelete: Cascade)
+
+  @@id([tradeId, targetToolId])
+  @@index([targetToolId])
+  @@index([tradeId])
+}
+
+model ItfConfirmationTool {
+  id                        String                     @id @default(cuid())
+  name                      String
+  description               String?                    @db.Text
+  userId                    String
+  user                      User                       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  isDefault                 Boolean                    @default(false)
+  trades                    Trade[]
+  tradeItfConfirmationTools TradeItfConfirmationTool[]
+  createdAt                 DateTime                   @default(now())
+  updatedAt                 DateTime                   @updatedAt
+
+  @@index([userId, name])
+}
+
+model EntryModelTool {
+  id                   String                @id @default(cuid())
+  name                 String
+  description          String?               @db.Text
+  userId               String
+  user                 User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  isDefault            Boolean               @default(false)
+  trades               Trade[]
+  tradeEntryModelTools TradeEntryModelTool[]
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @updatedAt
+
+  @@index([userId, name])
+}
+
+model EntryTimeframeTool {
+  id                       String                    @id @default(cuid())
+  name                     String
+  description              String?                   @db.Text
+  userId                   String
+  user                     User                      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  isDefault                Boolean                   @default(false)
+  trades                   Trade[]
+  tradeEntryTimeframeTools TradeEntryTimeframeTool[]
+  createdAt                DateTime                  @default(now())
+  updatedAt                DateTime                  @updatedAt
+
+  @@index([userId, name])
+}
+
+model FtaTool {
+  id            String         @id @default(cuid())
+  name          String
+  description   String?        @db.Text
+  userId        String
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  isDefault     Boolean        @default(false)
+  trades        Trade[]
+  tradeFtaTools TradeFtaTool[]
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  @@index([userId, name])
+}
+
+model TargetTool {
+  id               String            @id @default(cuid())
+  name             String
+  description      String?           @db.Text
+  userId           String
+  user             User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  isDefault        Boolean           @default(false)
+  trades           Trade[]
+  tradeTargetTools TradeTargetTool[]
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+
+  @@index([userId, name])
+}
+
+model Backtest {
+  id             String          @id @default(cuid())
+  name           String
+  description    String?
+  conclusionNotes String?         @db.Text
+  status         String          @default("in_progress")
+  strategy       String?
+  symbol         String?
+  timeframe      String?
+  tradingSetupId String?
+  tradingSetup   TradingSetup?   @relation(fields: [tradingSetupId], references: [id], onDelete: SetNull)
+  userId         String
+  user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  trades         BacktestTrade[]
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  @@index([userId])
+  @@index([tradingSetupId])
+}
+
+model BacktestTrade {
+  id                 String          @id @default(cuid())
+  backtestId         String
+  backtest           Backtest        @relation(fields: [backtestId], references: [id], onDelete: Cascade)
+  userId             String
+  user               User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  date               DateTime?
+  exitDate           DateTime?
+  tradingSessionId   String?
+  tradingSession     TradingSession? @relation(fields: [tradingSessionId], references: [id], onDelete: SetNull)
+  pair               String?
+  direction      String?
+  scenario       String?
+  riskPercentage Float?
+  rr             Float?
+  resultPercent  Float?
+  rrLabel        String?
+  pnl            Float?
+  followedPlan   Boolean?  @default(false)
+  notes          String?   @db.Text
+  analysisNotes  String?   @db.Text
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([userId])
+  @@index([backtestId])
+  @@index([date])
+  @@index([tradingSessionId])
+}
+
+model UserTablePreference {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tableId      String
+  columnWidths Json?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([userId, tableId])
+  @@index([userId])
+}
+
+model Dashboard {
+  id          String           @id @default(cuid())
+  userId      String
+  user        User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  isDefault   Boolean          @default(false)
+  pages       DashboardPage[]
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  @@index([userId])
+  @@unique([userId, isDefault], map: "user_default_dashboard_unique")
+}
+
+model DashboardPage {
+  id          String           @id @default(cuid())
+  dashboardId String
+  dashboard   Dashboard        @relation(fields: [dashboardId], references: [id], onDelete: Cascade)
+  name        String
+  slug        String
+  order       Int              @default(0)
+  widgets     WidgetInstance[]
+  layouts     WidgetLayout[]
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  @@index([dashboardId, order])
+  @@unique([dashboardId, slug])
+}
+
+model WidgetInstance {
+  id              String          @id @default(cuid())
+  dashboardPageId String
+  dashboardPage   DashboardPage   @relation(fields: [dashboardPageId], references: [id], onDelete: Cascade)
+  widgetType      String
+  title           String?
+  config          Json
+  layouts         WidgetLayout[]
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  @@index([dashboardPageId])
+}
+
+model WidgetLayout {
+  id               String         @id @default(cuid())
+  dashboardPageId  String
+  dashboardPage    DashboardPage  @relation(fields: [dashboardPageId], references: [id], onDelete: Cascade)
+  widgetInstanceId String
+  widgetInstance   WidgetInstance @relation(fields: [widgetInstanceId], references: [id], onDelete: Cascade)
+  breakpoint       String
+  x                Int
+  y                Int
+  w                Int
+  h                Int
+  minW             Int?
+  minH             Int?
+  maxW             Int?
+  maxH             Int?
+
+  @@index([dashboardPageId, breakpoint])
+  @@unique([dashboardPageId, breakpoint, widgetInstanceId])
+}
+
+model Analytics {
+  id         String        @id @default(cuid())
+  userId     String
+  user       User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  fromDate   DateTime
+  toDate     DateTime
+  symbol     String
+  bias       String
+  biasResult String?
+  dayOfWeek  String?
+  notes      String?       @db.Text
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+  analyticNotes AnalyticsNote[]
+
+  @@index([userId])
+  @@index([fromDate])
+  @@index([toDate])
+  @@index([symbol])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Analytics Notes - free-form notes attached to an analytics entry
+// ═══════════════════════════════════════════════════════════════════════════
+
+model AnalyticsNote {
+  id          String    @id @default(cuid())
+  analyticsId String
+  analytics   Analytics @relation(fields: [analyticsId], references: [id], onDelete: Cascade)
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title       String    @default("Untitled")
+  content     String?   @db.Text
+  sortOrder   Int       @default(0)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([analyticsId])
+  @@index([userId])
+}
+
+model Mt5Token {
+  id               String         @id @default(cuid())
+  token            String         @unique
+  tradingAccountId String         @unique
+  tradingAccount   TradingAccount @relation(fields: [tradingAccountId], references: [id], onDelete: Cascade)
+  mt5Account       String
+  broker           String?
+  isActive         Boolean        @default(true)
+  lastSyncAt       DateTime?
+  lastConnectedAt  DateTime?
+  commands         Mt5Command[]
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  @@index([token])
+  @@index([mt5Account])
+}
+
+model Mt5Command {
+  id             String    @id @default(cuid())
+  mt5TokenId     String
+  mt5Token       Mt5Token  @relation(fields: [mt5TokenId], references: [id], onDelete: Cascade)
+  command        String
+  acknowledged   Boolean   @default(false)
+  acknowledgedAt DateTime?
+  createdAt      DateTime  @default(now())
+
+  @@index([mt5TokenId])
+  @@index([acknowledged])
+}
+
+model CtraderToken {
+  id                  String         @id @default(cuid())
+  tradingAccountId    String         @unique
+  tradingAccount      TradingAccount @relation(fields: [tradingAccountId], references: [id], onDelete: Cascade)
+  ctidTraderAccountId String
+  accessToken         String         @db.Text
+  refreshToken        String         @db.Text
+  expiresAt           DateTime?
+  environment         String         @default("demo")
+  brokerName          String?
+  accountNumber       String?
+  isActive            Boolean        @default(true)
+  lastSyncAt          DateTime?
+  lastConnectedAt     DateTime?
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+
+  @@index([ctidTraderAccountId])
+}
+
+/** Per-user token pasted once into the TradeTrackSync MT5 Expert Advisor. Rotatable/revocable. */
+model EaToken {
+  id         String    @id @default(cuid())
+  userId     String    @unique
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token      String    @unique
+  lastUsedAt DateTime?
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  @@index([token])
+}
+
+/** MT5 logins seen by the EA that the user has not yet approved. Drives "connect this account?" cards. */
+model PendingMt5Account {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  login       String
+  server      String
+  company     String?
+  currency    String?
+  firstSeenAt DateTime @default(now())
+  lastSeenAt  DateTime @default(now())
+
+  @@unique([userId, login, server])
+  @@index([userId])
+}
+
+model Feedback {
+  id             String    @id @default(cuid())
+  type           String
+  email          String
+  message        String    @db.Text
+  telegramLink   String?
+  phoneNumber    String?
+  userId         String?
+  user           User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+  sentToTelegram Boolean   @default(false)
+  repliedAt      DateTime?
+  status         String    @default("new")
+  createdAt      DateTime  @default(now())
+
+  @@index([userId])
+  @@index([createdAt])
+  @@index([status])
+}
+
+model AiResponseFeedback {
+  id                  String   @id @default(cuid())
+  userId              String
+  user                User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  surface             String // performance | symbols | sessions | days | insights
+  filterHash          String
+  responseGeneratedAt DateTime
+  rating              String // 'up' | 'down'
+  reasons             String[]
+  comment             String?  @db.Text
+  model               String?
+  locale              String
+  period              String
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@unique([userId, surface, filterHash])
+  @@index([surface, rating])
+  @@index([createdAt])
+}
+
+model TerminalImportFailure {
+  id               String          @id @default(cuid())
+  userId           String
+  tradingAccountId String?
+  terminal         String
+  stage            String
+  fileName         String
+  fileUrl          String
+  filePathname     String
+  fileBytes        Int
+  mimeType         String?
+  errorMessage     String          @db.Text
+  createdAt        DateTime        @default(now())
+  user             User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tradingAccount   TradingAccount? @relation(fields: [tradingAccountId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([terminal])
+  @@index([createdAt])
+}
+
+model ScheduledNotification {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  eventId     String
+  eventTitle  String
+  eventTime   DateTime
+  notifyAt    DateTime
+  qstashMsgId String?
+  sent        Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  @@unique([userId, eventId])
+  @@index([userId])
+  @@index([notifyAt])
+}
+
+model TradingJournal {
+  id     String   @id @default(cuid())
+  userId String
+  user   User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  date   DateTime @db.Date
+
+  // pre-market planning
+  preMarketPlan    String? @db.Text
+  dailyGoal        String?
+  marketConditions String?
+
+  // post-market review
+  postMarketReview String? @db.Text
+  goalAchieved     String?
+  lessonLearned    String? @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, date])
+  @@index([userId])
+  @@index([date])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STRATEGIES - Trading Setups (TradZilla-style with Groups & Rules)
+// ═══════════════════════════════════════════════════════════════════════════
+
+model TradingSetup {
+  id          String   @id @default(cuid())
+  name        String
+  emoji       String?
+  color       String?  // hex color e.g. "#4f46e5"
+  description String?  @db.Text
+  symbols       String[]
+  isPublic      Boolean  @default(false)
+  shareId       String?  @unique
+  shareAllowCopy Boolean @default(true)
+
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ruleSetId String?  @unique
+  ruleSet   RuleSet? @relation(fields: [ruleSetId], references: [id], onDelete: SetNull)
+
+  trades      Trade[]
+  backtests   Backtest[]
+  notes       SetupNote[]
+  screenshots SetupScreenshot[]
+  shares      SetupShare[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([isPublic])
+  @@index([ruleSetId])
+}
+
+enum SetupScreenshotCategory {
+  A_PLUS
+  MISTAKE
+  VARIATION
+}
+
+model SetupScreenshot {
+  id        String                  @id @default(cuid())
+  setupId   String
+  setup     TradingSetup            @relation(fields: [setupId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  url       String
+  pathname  String
+  caption     String?
+  category    SetupScreenshotCategory @default(A_PLUS)
+  description String?                 @map("timeframe")
+  sortOrder   Int                     @default(0)
+  createdAt DateTime                @default(now())
+
+  @@index([setupId])
+  @@index([userId])
+}
+
+model SetupShare {
+  id           String       @id @default(cuid())
+  setupId      String
+  setup        TradingSetup @relation(fields: [setupId], references: [id], onDelete: Cascade)
+  ownerId      String
+  owner        User         @relation("SetupShareOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  invitedEmail String
+  createdAt    DateTime     @default(now())
+
+  @@unique([setupId, invitedEmail])
+  @@index([invitedEmail])
+  @@index([setupId])
+  @@index([ownerId])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Setup Notes - free-form notes attached to a trading setup
+// ═══════════════════════════════════════════════════════════════════════════
+
+model SetupNote {
+  id        String       @id @default(cuid())
+  setupId   String
+  setup     TradingSetup @relation(fields: [setupId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String       @default("Untitled")
+  content   String?      @db.Text
+  sortOrder Int          @default(0)
+  sharedVisible Boolean  @default(false)
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  @@index([setupId])
+  @@index([userId])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Mistake Templates - reusable trading mistake presets
+// ═══════════════════════════════════════════════════════════════════════════
+
+model MistakeTemplate {
+  id               String   @id @default(cuid())
+  name             String
+  shortDescription String?  @db.Text
+  category         String?
+  userId           String
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@unique([userId, name])
+  @@index([userId])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Note templates - user-defined TipTap JSON defaults per kind
+// ═══════════════════════════════════════════════════════════════════════════
+
+model NoteTemplate {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  kind      String
+  name      String
+  nameKey   String
+  emoji     String?
+  color     String?
+  content   String   @db.Text
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  defaultForUsers UserNoteTemplateDefault[]
+
+  @@unique([userId, kind, nameKey])
+  @@index([userId, kind])
+}
+
+model UserNoteTemplateDefault {
+  userId     String
+  kind       String
+  templateId String?
+  updatedAt  DateTime @updatedAt
+
+  user     User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  template NoteTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
+
+  @@id([userId, kind])
+  @@index([templateId])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// User Achievements - gamification system
+// ═══════════════════════════════════════════════════════════════════════════
+
+model UserAchievement {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  achievementId String
+  unlockedAt    DateTime @default(now())
+  progress      Int      @default(0)
+  maxProgress   Int      @default(1)
+
+  @@unique([userId, achievementId])
+  @@index([userId])
+  @@index([achievementId])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EMAIL CAMPAIGNS
+// ═══════════════════════════════════════════════════════════════════════════
+
+model UserEmailCampaign {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  campaignType String // 'feedback_request' | 'onboarding_reminder' | 're_engagement' | 'long_term_feedback'
+  locale       String // 'uk' | 'en' - мова, на якій було відправлено email
+  subject      String
+  sentAt       DateTime @default(now())
+
+  // Tracking (опціонально, якщо використовуєте Resend webhooks)
+  openedAt  DateTime?
+  clickedAt DateTime?
+  bouncedAt DateTime?
+  complainedAt DateTime?
+  deliveredAt DateTime?
+  resendEmailId String?
+  error     String?   @db.Text
+
+  // Metadata для зручності
+  metadata Json? // { googleFormUrl, hasTrades, etc. }
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([campaignType])
+  @@index([locale])
+  @@index([sentAt])
+  @@index([userId, campaignType]) // для швидкого пошуку останньої розсилки
+  @@index([userId, campaignType, locale]) // для пошуку останньої розсилки конкретної мови
+  @@index([resendEmailId])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BLOG - SEO articles (public, no userId - managed by admin)
+// ═══════════════════════════════════════════════════════════════════════════
+
+model BlogPost {
+  id              String    @id @default(cuid())
+  slug            String    @unique
+  /** locale of the article, e.g. 'en' | 'uk' */
+  locale          String    @default("en")
+  /** optional key to group translations of the same article across locales */
+  translationKey  String?
+  title           String
+  metaDescription String?   @db.Text
+  content         String    @db.Text
+  coverImageUrl   String?   @db.Text
+  publishedAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([publishedAt])
+  @@index([slug])
+  @@index([locale, publishedAt])
+  @@index([translationKey])
+}
