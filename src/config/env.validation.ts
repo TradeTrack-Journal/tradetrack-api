@@ -9,6 +9,17 @@ const envSchema = z.object({
 	NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
 	PORT: z.coerce.number().int().positive().default(3001),
 	DATABASE_URL: z.string().min(1, 'DATABASE_URL is required'),
+
+	// cTrader (Phase 1+). Optional so the service degrades gracefully (warn + skip) when absent,
+	// instead of blocking boot. ENCRYPTION_KEY must equal the main app's key to decrypt tokens.
+	ENCRYPTION_KEY: z.string().optional(),
+	CTRADER_CLIENT_ID: z.string().optional(),
+	CTRADER_CLIENT_SECRET: z.string().optional(),
+
+	// PoC-only account override: connect a single hard-provided account instead of reading the DB.
+	CTRADER_POC_ACCESS_TOKEN: z.string().optional(),
+	CTRADER_POC_ACCOUNT_ID: z.string().optional(),
+	CTRADER_POC_ENVIRONMENT: z.enum(['demo', 'live']).optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;
