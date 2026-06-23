@@ -1,8 +1,8 @@
 import { Module } from '@nestjs/common';
 
-import { CtraderPocService } from './ctrader-poc.service';
+import { CtraderConnectionManager } from './ctrader-connection-manager';
 
 @Module({
-	providers: [CtraderPocService],
+	providers: [CtraderConnectionManager],
 })
 export class CtraderModule {}
