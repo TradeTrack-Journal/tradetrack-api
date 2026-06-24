@@ -39,7 +39,7 @@ interface EnvSession {
 export class CtraderConnectionManager implements OnModuleInit, OnModuleDestroy {
 	private readonly logger = new Logger(CtraderConnectionManager.name);
 	private readonly sessions = new Map<CtraderEnvironment, EnvSession>();
-	private readonly accountsByCtid = new Map<number, PoolAccount>();
+	private readonly accountsByCtid = new Map<string, PoolAccount>();
 	private stopped = false;
 
 	constructor(
@@ -73,14 +73,14 @@ export class CtraderConnectionManager implements OnModuleInit, OnModuleDestroy {
 			return;
 		}
 
-		const accounts = await this.loadAccounts();
+		const accounts = this.dedupeByCtid(await this.loadAccounts());
 		if (accounts.length === 0) {
 			this.logger.warn('No active cTrader accounts in DB — cTrader manager idle.');
 			return;
 		}
 
 		for (const account of accounts) {
-			this.accountsByCtid.set(account.ctidTraderAccountId, account);
+			this.accountsByCtid.set(this.ctidKey(account.environment, account.ctidTraderAccountId), account);
 			const session = this.sessions.get(account.environment) ?? {
 				accounts: [],
 				reconnectAttempt: 0,
@@ -217,7 +217,7 @@ export class CtraderConnectionManager implements OnModuleInit, OnModuleDestroy {
 		ctid: number,
 		payload: ExecutionEventPayload
 	): void {
-		const account = this.accountsByCtid.get(ctid);
+		const account = this.accountsByCtid.get(this.ctidKey(environment, ctid));
 		if (!account) {
 			this.logger.warn(`[${environment}] execution event for unknown account ${ctid} — ignored`);
 			return;
@@ -369,6 +369,51 @@ export class CtraderConnectionManager implements OnModuleInit, OnModuleDestroy {
 			}
 		}
 		return accounts;
+	}
+
+	/**
+	 * A cTrader account (ctidTraderAccountId) must be managed by exactly one trading account — the
+	 * product blocks duplicate connections at connect time, but defend against stale/duplicate
+	 * tokens here too. If several accounts share a ctid, keep the one with the freshest token
+	 * (latest expiry) and drop the rest, so we authenticate each ctid ONCE (no redundant
+	 * accountAuth, no "[object Object]" noise) and the surviving account is the one whose token
+	 * actually authenticates the socket (its symbol list resolves names instead of raw ids).
+	 * Grouped by (environment, ctid) so a ctid is never collapsed across environments.
+	 */
+	private dedupeByCtid(accounts: PoolAccount[]): PoolAccount[] {
+		const byCtid = new Map<string, PoolAccount[]>();
+		for (const account of accounts) {
+			const key = this.ctidKey(account.environment, account.ctidTraderAccountId);
+			const list = byCtid.get(key) ?? [];
+			list.push(account);
+			byCtid.set(key, list);
+		}
+
+		const kept: PoolAccount[] = [];
+		for (const [key, list] of byCtid) {
+			if (list.length === 1) {
+				kept.push(list[0]);
+				continue;
+			}
+			// Freshest token wins; an unknown (null) expiry sorts as epoch 0, below any real token.
+			const ranked = [...list].sort((a, b) => this.tokenFreshness(b) - this.tokenFreshness(a));
+			const [winner, ...skipped] = ranked;
+			kept.push(winner);
+			this.logger.warn(
+				`${key} linked by ${list.length} trading accounts — keeping ${winner.tradingAccountId} (user ${winner.userId}), skipping ${skipped.map((a) => a.tradingAccountId).join(', ')}`
+			);
+		}
+		return kept;
+	}
+
+	/** Sort key for picking the freshest token among accounts sharing a ctid (null expiry = epoch 0). */
+	private tokenFreshness(account: PoolAccount): number {
+		return account.expiresAt?.getTime() ?? 0;
+	}
+
+	/** Key for accountsByCtid / dedup: a ctid is unique per environment, so scope it by environment. */
+	private ctidKey(environment: CtraderEnvironment, ctid: number): string {
+		return `${environment}:${ctid}`;
 	}
 
 	private appCredentials(): { clientId: string; clientSecret: string } | undefined {
