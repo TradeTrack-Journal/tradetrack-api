@@ -6,6 +6,7 @@ import { decrypt, encrypt } from '../crypto';
 import { PrismaService } from '../prisma';
 import { refreshAccessToken } from './ctrader-client';
 import { CtraderConnection } from './ctrader-connection';
+import { CtraderTradeWriter } from './ctrader-trade-writer';
 import {
 	DEFAULT_TOKEN_LIFETIME_MS,
 	RECONNECT_BASE_DELAY_MS,
@@ -38,11 +39,13 @@ interface EnvSession {
 export class CtraderConnectionManager implements OnModuleInit, OnModuleDestroy {
 	private readonly logger = new Logger(CtraderConnectionManager.name);
 	private readonly sessions = new Map<CtraderEnvironment, EnvSession>();
+	private readonly accountsByCtid = new Map<number, PoolAccount>();
 	private stopped = false;
 
 	constructor(
 		private readonly config: ConfigService<Env, true>,
-		private readonly prisma: PrismaService
+		private readonly prisma: PrismaService,
+		private readonly writer: CtraderTradeWriter
 	) {}
 
 	onModuleInit(): void {
@@ -61,6 +64,7 @@ export class CtraderConnectionManager implements OnModuleInit, OnModuleDestroy {
 			session.connection?.close();
 		}
 		this.sessions.clear();
+		this.accountsByCtid.clear();
 	}
 
 	private async start(): Promise<void> {
@@ -76,6 +80,7 @@ export class CtraderConnectionManager implements OnModuleInit, OnModuleDestroy {
 		}
 
 		for (const account of accounts) {
+			this.accountsByCtid.set(account.ctidTraderAccountId, account);
 			const session = this.sessions.get(account.environment) ?? {
 				accounts: [],
 				reconnectAttempt: 0,
@@ -86,7 +91,9 @@ export class CtraderConnectionManager implements OnModuleInit, OnModuleDestroy {
 		}
 
 		for (const environment of this.sessions.keys()) {
-			void this.connectEnv(environment);
+			void this.connectEnv(environment).catch((error) =>
+				this.logger.error(`[${environment}] connect attempt crashed: ${describe(error)}`)
+			);
 		}
 	}
 
@@ -137,6 +144,11 @@ export class CtraderConnectionManager implements OnModuleInit, OnModuleDestroy {
 				try {
 					await this.ensureFreshToken(account);
 					await connection.accountAuth(account.accessToken, account.ctidTraderAccountId);
+					account.symbolNames = await this.fetchSymbolNames(
+						connection,
+						account.ctidTraderAccountId,
+						environment
+					);
 					authenticated += 1;
 					this.logger.log(`[${environment}] account ${account.ctidTraderAccountId} authenticated`);
 				} catch (error) {
@@ -205,13 +217,50 @@ export class CtraderConnectionManager implements OnModuleInit, OnModuleDestroy {
 		ctid: number,
 		payload: ExecutionEventPayload
 	): void {
-		// Phase 3 will persist these into the Trade table; for now this is a resilient live feed.
-		const deal = payload.deal
-			? ` deal=${payload.deal.dealId} side=${String(payload.deal.tradeSide)} vol=${payload.deal.volume}`
-			: '';
-		this.logger.log(
-			`[${environment}] ▶ exec type=${String(payload.executionType)} account=${ctid}${deal}`
-		);
+		const account = this.accountsByCtid.get(ctid);
+		if (!account) {
+			this.logger.warn(`[${environment}] execution event for unknown account ${ctid} — ignored`);
+			return;
+		}
+		void this.writer
+			.record(account, payload)
+			.catch((error) =>
+				this.logger.error(`[${environment}] trade write failed for ${ctid}: ${describe(error)}`)
+			);
+	}
+
+	private async fetchSymbolNames(
+		connection: CtraderConnection,
+		ctid: number,
+		environment: CtraderEnvironment
+	): Promise<Map<number, string>> {
+		const map = new Map<number, string>();
+		try {
+			const res = (await connection.request('ProtoOASymbolsListReq', {
+				ctidTraderAccountId: ctid,
+				includeArchivedSymbols: true,
+			})) as {
+				symbol?: Array<{ symbolId?: string | number; symbolName?: string }>;
+				archivedSymbol?: Array<{ symbolId?: string | number; name?: string }>;
+			};
+			for (const sym of res.symbol ?? []) {
+				const id = Number(sym.symbolId);
+				if (Number.isFinite(id) && sym.symbolName) {
+					map.set(id, sym.symbolName);
+				}
+			}
+			for (const sym of res.archivedSymbol ?? []) {
+				const id = Number(sym.symbolId);
+				if (Number.isFinite(id) && sym.name) {
+					map.set(id, sym.name);
+				}
+			}
+		} catch (error) {
+			this.logger.warn(
+				`[${environment}] symbol list failed for ${ctid} (names fall back to id): ${describe(error)}`
+			);
+		}
+		return map;
 	}
 
 	private scheduleReconnect(environment: CtraderEnvironment): void {
@@ -234,7 +283,9 @@ export class CtraderConnectionManager implements OnModuleInit, OnModuleDestroy {
 
 		session.reconnectTimer = setTimeout(() => {
 			session.reconnectTimer = undefined;
-			void this.connectEnv(environment);
+			void this.connectEnv(environment).catch((error) =>
+				this.logger.error(`[${environment}] connect attempt crashed: ${describe(error)}`)
+			);
 		}, delay);
 	}
 
@@ -286,6 +337,7 @@ export class CtraderConnectionManager implements OnModuleInit, OnModuleDestroy {
 				refreshToken: true,
 				expiresAt: true,
 				environment: true,
+				tradingAccount: { select: { userId: true, nominal: true } },
 			},
 		});
 
@@ -294,6 +346,10 @@ export class CtraderConnectionManager implements OnModuleInit, OnModuleDestroy {
 			const ctid = Number(token.ctidTraderAccountId);
 			if (!Number.isFinite(ctid) || ctid <= 0) {
 				this.logger.warn(`Skipping token ${token.id}: invalid ctidTraderAccountId`);
+				continue;
+			}
+			if (!token.tradingAccount) {
+				this.logger.warn(`Skipping token ${token.id}: no linked trading account`);
 				continue;
 			}
 			try {
@@ -305,6 +361,8 @@ export class CtraderConnectionManager implements OnModuleInit, OnModuleDestroy {
 					refreshToken: decrypt(token.refreshToken),
 					expiresAt: token.expiresAt,
 					environment: token.environment === 'live' ? 'live' : 'demo',
+					userId: token.tradingAccount.userId,
+					nominal: token.tradingAccount.nominal,
 				});
 			} catch (error) {
 				this.logger.error(`Skipping token ${token.id}: ${describe(error)}`);

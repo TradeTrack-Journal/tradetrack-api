@@ -61,6 +61,11 @@ export class CtraderConnection {
 		);
 	}
 
+	/** Run an arbitrary request/response command (e.g. ProtoOASymbolsListReq) with a timeout. */
+	async request(payloadName: string, data?: Record<string, unknown>): Promise<unknown> {
+		return this.command(() => this.connection.sendCommand(payloadName, data));
+	}
+
 	/** Idempotent teardown — clears timers and destroys the socket. */
 	close(): void {
 		this.lost = true;
