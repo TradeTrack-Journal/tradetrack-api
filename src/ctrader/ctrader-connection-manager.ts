@@ -9,6 +9,7 @@ import { CtraderConnection } from './ctrader-connection';
 import { CtraderTradeWriter } from './ctrader-trade-writer';
 import {
 	DEFAULT_TOKEN_LIFETIME_MS,
+	RECONCILE_INTERVAL_MS,
 	RECONNECT_BASE_DELAY_MS,
 	RECONNECT_MAX_DELAY_MS,
 	TOKEN_REFRESH_SKEW_MS,
@@ -22,6 +23,8 @@ interface EnvSession {
 	reconnectTimer?: NodeJS.Timeout;
 	/** Bumped on every (re)connect attempt; lets a superseded attempt detect it lost ownership. */
 	generation: number;
+	/** Signature of the account set this session is connected for; a change triggers a reconnect. */
+	signature: string;
 }
 
 /**
@@ -41,6 +44,10 @@ export class CtraderConnectionManager implements OnModuleInit, OnModuleDestroy {
 	private readonly sessions = new Map<CtraderEnvironment, EnvSession>();
 	private readonly accountsByCtid = new Map<string, PoolAccount>();
 	private stopped = false;
+	private reconcileTimer?: NodeJS.Timeout;
+	private reconciling = false;
+	/** Last (count, max-updatedAt) of active tokens — a cheap gate before a full reload. */
+	private lastProbe: { count: number; updatedAt: number } = { count: -1, updatedAt: 0 };
 
 	constructor(
 		private readonly config: ConfigService<Env, true>,
@@ -57,6 +64,10 @@ export class CtraderConnectionManager implements OnModuleInit, OnModuleDestroy {
 
 	onModuleDestroy(): void {
 		this.stopped = true;
+		if (this.reconcileTimer) {
+			clearInterval(this.reconcileTimer);
+			this.reconcileTimer = undefined;
+		}
 		for (const session of this.sessions.values()) {
 			if (session.reconnectTimer) {
 				clearTimeout(session.reconnectTimer);
@@ -75,8 +86,8 @@ export class CtraderConnectionManager implements OnModuleInit, OnModuleDestroy {
 
 		const accounts = this.dedupeByCtid(await this.loadAccounts());
 		if (accounts.length === 0) {
-			this.logger.warn('No active cTrader accounts in DB — cTrader manager idle.');
-			return;
+			// Don't bail — arm the reconcile loop so the first account a user connects is picked up.
+			this.logger.warn('No active cTrader accounts in DB yet — waiting for one to be connected.');
 		}
 
 		for (const account of accounts) {
@@ -85,9 +96,14 @@ export class CtraderConnectionManager implements OnModuleInit, OnModuleDestroy {
 				accounts: [],
 				reconnectAttempt: 0,
 				generation: 0,
+				signature: '',
 			};
 			session.accounts.push(account);
 			this.sessions.set(account.environment, session);
+		}
+
+		for (const session of this.sessions.values()) {
+			session.signature = this.computeSignature(session.accounts);
 		}
 
 		for (const environment of this.sessions.keys()) {
@@ -95,6 +111,10 @@ export class CtraderConnectionManager implements OnModuleInit, OnModuleDestroy {
 				this.logger.error(`[${environment}] connect attempt crashed: ${describe(error)}`)
 			);
 		}
+
+		this.reconcileTimer = setInterval(() => {
+			void this.reconcile();
+		}, RECONCILE_INTERVAL_MS);
 	}
 
 	private async connectEnv(environment: CtraderEnvironment): Promise<void> {
@@ -165,6 +185,9 @@ export class CtraderConnectionManager implements OnModuleInit, OnModuleDestroy {
 				return;
 			}
 			session.reconnectAttempt = 0;
+			// Re-sync the signature from the (possibly token-refreshed) accounts so the manager's own
+			// token refresh during this connect isn't mistaken for an external change next reconcile.
+			session.signature = this.computeSignature(session.accounts);
 			this.logger.log(
 				`[${environment}] live — ${authenticated}/${session.accounts.length} account(s) authenticated, heartbeat + liveness running`
 			);
@@ -287,6 +310,138 @@ export class CtraderConnectionManager implements OnModuleInit, OnModuleDestroy {
 				this.logger.error(`[${environment}] connect attempt crashed: ${describe(error)}`)
 			);
 		}, delay);
+	}
+
+	/**
+	 * Periodically reconcile live connections with the DB so accounts a user connects (or removes)
+	 * are picked up without a process restart. A cheap aggregate probe (count + max updatedAt of
+	 * active tokens) gates the full reload, so the steady-state cost is one trivial query per tick.
+	 */
+	private async reconcile(): Promise<void> {
+		if (this.stopped || this.reconciling) {
+			return; // a slow tick must not overlap the next interval fire
+		}
+		this.reconciling = true;
+		try {
+			const probe = await this.prisma.ctraderToken.aggregate({
+				where: { isActive: true },
+				_count: { _all: true },
+				_max: { updatedAt: true },
+			});
+			const count = probe._count._all;
+			const updatedAt = probe._max.updatedAt?.getTime() ?? 0;
+			if (count === this.lastProbe.count && updatedAt === this.lastProbe.updatedAt) {
+				return; // nothing changed since the last tick
+			}
+			this.lastProbe = { count, updatedAt };
+
+			const fresh = this.dedupeByCtid(await this.loadAccounts());
+			if (this.stopped) {
+				return;
+			}
+			this.applyReconcile(fresh);
+		} catch (error) {
+			this.logger.error(`reconcile failed: ${describe(error)}`);
+		} finally {
+			this.reconciling = false;
+		}
+	}
+
+	/**
+	 * Apply the freshly-loaded account set to the live sessions. Fully synchronous (no awaits) so the
+	 * mutation of sessions / accountsByCtid is atomic relative to any suspended connectEnv. On a
+	 * change it bumps the session generation (superseding any in-flight connect) and reuses the
+	 * hardened reconnect path; the array reference is REPLACED, never mutated, so a connect loop that
+	 * is iterating the old array finishes harmlessly before bailing on its superseded() check.
+	 */
+	private applyReconcile(fresh: PoolAccount[]): void {
+		const freshByEnv = new Map<CtraderEnvironment, PoolAccount[]>();
+		for (const account of fresh) {
+			const list = freshByEnv.get(account.environment) ?? [];
+			list.push(account);
+			freshByEnv.set(account.environment, list);
+		}
+
+		const environments = new Set<CtraderEnvironment>([...this.sessions.keys(), ...freshByEnv.keys()]);
+
+		for (const environment of environments) {
+			const desired = freshByEnv.get(environment) ?? [];
+			const session = this.sessions.get(environment);
+
+			if (!session) {
+				if (desired.length === 0) {
+					continue;
+				}
+				// New environment: seed a session and connect it (connectEnv bumps generation to 1).
+				this.sessions.set(environment, {
+					accounts: desired,
+					reconnectAttempt: 0,
+					generation: 0,
+					signature: this.computeSignature(desired),
+				});
+				this.setRouting(environment, desired);
+				this.logger.log(
+					`[${environment}] new environment with ${desired.length} account(s) — connecting`
+				);
+				void this.connectEnv(environment).catch((error) =>
+					this.logger.error(`[${environment}] connect attempt crashed: ${describe(error)}`)
+				);
+				continue;
+			}
+
+			if (desired.length === 0) {
+				// Environment went empty: tear the socket down and drop the session.
+				this.logger.warn(`[${environment}] no active accounts remain — tearing down`);
+				if (session.reconnectTimer) {
+					clearTimeout(session.reconnectTimer);
+					session.reconnectTimer = undefined;
+				}
+				session.generation += 1; // supersede any in-flight connect before we drop the session
+				const connection = session.connection;
+				session.connection = undefined; // clear before close so nothing sees a half-closed socket
+				connection?.close();
+				this.clearRouting(environment, session.accounts);
+				this.sessions.delete(environment);
+				continue;
+			}
+
+			const signature = this.computeSignature(desired);
+			if (signature === session.signature) {
+				continue; // no change for this environment
+			}
+
+			this.logger.log(`[${environment}] account set changed — reconnecting`);
+			this.clearRouting(environment, session.accounts);
+			session.accounts = desired; // replace the reference; never mutate the array a loop may hold
+			this.setRouting(environment, desired);
+			session.signature = signature;
+			// Bump generation FIRST so any in-flight connect supersedes itself at its next await. Then
+			// pass the NEW generation to handleLost so its guard PASSES and it closes the socket and
+			// schedules the single reconnect that picks up `desired`. (Passing the old generation would
+			// make handleLost no-op and the reconnect would never fire — this is intentional.)
+			session.generation += 1;
+			this.handleLost(environment, session.generation, 'reconcile: account set changed');
+		}
+	}
+
+	private setRouting(environment: CtraderEnvironment, accounts: PoolAccount[]): void {
+		for (const account of accounts) {
+			this.accountsByCtid.set(this.ctidKey(environment, account.ctidTraderAccountId), account);
+		}
+	}
+
+	private clearRouting(environment: CtraderEnvironment, accounts: PoolAccount[]): void {
+		for (const account of accounts) {
+			this.accountsByCtid.delete(this.ctidKey(environment, account.ctidTraderAccountId));
+		}
+	}
+
+	/** Stable fingerprint of an environment's account set: a change means reconnect is needed. */
+	private computeSignature(accounts: PoolAccount[]): string {
+		return [...accounts]
+			.sort((a, b) => a.ctidTraderAccountId - b.ctidTraderAccountId)
+			.map((a) => `${a.ctidTraderAccountId}:${a.tokenId}:${a.expiresAt?.getTime() ?? 0}`)
+			.join('|');
 	}
 
 	/** Refresh the account's access token in place (and in the DB) when it is unknown or near expiry. */

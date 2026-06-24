@@ -18,6 +18,10 @@ export const LIVENESS_PROBE_INTERVAL_MS = 20_000;
 export const RECONNECT_BASE_DELAY_MS = 1_000;
 export const RECONNECT_MAX_DELAY_MS = 60_000;
 
+/** How often to reconcile live connections with the DB so newly connected / removed cTrader
+ *  accounts are picked up without a process restart. A cheap probe gates the full reload. */
+export const RECONCILE_INTERVAL_MS = 30_000;
+
 /** Refresh an access token this long before it actually expires. */
 export const TOKEN_REFRESH_SKEW_MS = 60_000;
 
