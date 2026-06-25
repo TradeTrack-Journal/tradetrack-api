@@ -4,6 +4,7 @@ import { ConfigService } from '@nestjs/config';
 import type { Env } from '../config';
 import { decrypt, encrypt } from '../crypto';
 import { PrismaService } from '../prisma';
+import { BackfillService } from './backfill.service';
 import { refreshAccessToken } from './ctrader-client';
 import { CtraderConnection } from './ctrader-connection';
 import { CtraderTradeWriter } from './ctrader-trade-writer';
@@ -52,7 +53,8 @@ export class CtraderConnectionManager implements OnModuleInit, OnModuleDestroy {
 	constructor(
 		private readonly config: ConfigService<Env, true>,
 		private readonly prisma: PrismaService,
-		private readonly writer: CtraderTradeWriter
+		private readonly writer: CtraderTradeWriter,
+		private readonly backfill: BackfillService
 	) {}
 
 	onModuleInit(): void {
@@ -171,6 +173,15 @@ export class CtraderConnectionManager implements OnModuleInit, OnModuleDestroy {
 					);
 					authenticated += 1;
 					this.logger.log(`[${environment}] account ${account.ctidTraderAccountId} authenticated`);
+					// Fire-and-forget: pull recent closed history so deals during downtime aren't lost.
+					// The watermark keeps re-runs on reconnect small; writes are idempotent.
+					void this.backfill
+						.backfillAccount(connection, account)
+						.catch((error) =>
+							this.logger.error(
+								`[${environment}] backfill failed for ${account.ctidTraderAccountId}: ${describe(error)}`
+							)
+						);
 				} catch (error) {
 					// Isolate per-account failures (bad/revoked token) so one account can't take the
 					// whole environment's socket down.

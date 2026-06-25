@@ -22,6 +22,15 @@ export const RECONNECT_MAX_DELAY_MS = 60_000;
  *  accounts are picked up without a process restart. A cheap probe gates the full reload. */
 export const RECONCILE_INTERVAL_MS = 30_000;
 
+/** On (re)connect, backfill closed history from this far back when there is no prior watermark. */
+export const BACKFILL_LOOKBACK_MS = 90 * 24 * 60 * 60 * 1000;
+
+/** Safety overlap subtracted from the trade watermark so a deal near the boundary isn't missed. */
+export const BACKFILL_WATERMARK_BUFFER_MS = 15 * 24 * 60 * 60 * 1000;
+
+/** Cap on deals returned by a single ProtoOADealListReq. */
+export const BACKFILL_MAX_ROWS = 10_000;
+
 /** Refresh an access token this long before it actually expires. */
 export const TOKEN_REFRESH_SKEW_MS = 60_000;
 

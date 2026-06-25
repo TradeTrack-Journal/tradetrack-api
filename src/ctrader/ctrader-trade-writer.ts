@@ -17,6 +17,21 @@ const VOLUME_PER_LOT = 10_000;
 /** Monetary integers are scaled by moneyDigits (2) → divide by 100 for account currency. */
 const MONEY_SCALE = 100;
 
+/** A position reconstructed from connect-time history (ProtoOADealListReq), in account currency. */
+export interface BackfillPosition {
+	positionId: string;
+	symbol: string;
+	direction: string;
+	quantity: number;
+	entryDate: Date;
+	fullyClosed: boolean;
+	/** Set only when fullyClosed — the realized totals already divided by MONEY_SCALE. */
+	exitDate: Date | null;
+	grossProfit: number;
+	commission: number;
+	swap: number;
+}
+
 /**
  * Persists cTrader execution events into the Trade table. One Trade row per position, keyed by
  * terminalTradeId = `ctrader_pos_{positionId}`, so the OPEN fill creates an open row (exitDate
@@ -39,10 +54,25 @@ export class CtraderTradeWriter {
 		if (!payload.deal || !positionId) {
 			return; // ORDER_ACCEPTED and friends carry no deal — nothing to persist
 		}
+		await this.serialize(account.userId, positionId, () => this.write(account, payload, positionId));
+	}
 
-		const key = `${account.userId}:ctrader_pos_${positionId}`;
+	/**
+	 * Persist a backfilled position (from connect-time history pull). Closed positions are written
+	 * with absolute realized values (SET, not accumulate) so re-running backfill on every reconnect
+	 * is idempotent and converges with whatever live events wrote. Open positions go through the
+	 * normal open path, which never clears a close — so a position that closed live can't be reopened
+	 * by a stale backfill snapshot. Serialized per position with live writes.
+	 */
+	async backfillPosition(account: PoolAccount, p: BackfillPosition): Promise<void> {
+		await this.serialize(account.userId, p.positionId, () => this.writeBackfill(account, p));
+	}
+
+	/** Run task on the per-position serialization chain so concurrent writes can't clobber each other. */
+	private serialize(userId: string, positionId: string, task: () => Promise<void>): Promise<void> {
+		const key = `${userId}:ctrader_pos_${positionId}`;
 		const previous = this.chains.get(key) ?? Promise.resolve();
-		const current = previous.then(() => this.write(account, payload, positionId));
+		const current = previous.then(task);
 		const tail: Promise<unknown> = current
 			.catch(() => undefined)
 			.finally(() => {
@@ -51,7 +81,7 @@ export class CtraderTradeWriter {
 				}
 			});
 		this.chains.set(key, tail);
-		await current;
+		return current;
 	}
 
 	private async write(
@@ -201,6 +231,72 @@ export class CtraderTradeWriter {
 		});
 		this.logger.log(
 			`${t.fullyClosed ? 'closed' : 'partial'} ${terminalTradeId} ${t.direction} ${t.symbol} pnl=${pnl} result=${result ?? '-'}`
+		);
+	}
+
+	private async writeBackfill(account: PoolAccount, p: BackfillPosition): Promise<void> {
+		const terminalTradeId = `ctrader_pos_${p.positionId}`;
+
+		// Not fully closed → just ensure the open row exists; upsertOpen never clears exitDate, so a
+		// position that closed via a live event can't be reopened by a stale backfill snapshot.
+		if (!p.fullyClosed) {
+			await this.upsertOpen(account, terminalTradeId, {
+				symbol: p.symbol,
+				direction: p.direction,
+				quantity: p.quantity,
+				entryDate: p.entryDate,
+			});
+			return;
+		}
+
+		// Fully closed → SET the absolute realized values (idempotent across re-runs / reconnects).
+		const grossProfit = roundMoney(p.grossProfit);
+		const commission = roundMoney(p.commission);
+		const swap = roundMoney(p.swap);
+		const pnl = roundMoney(grossProfit + commission + swap);
+		const profitPercentage =
+			computeProfitPercentageFromMoney(grossProfit, account.nominal) ?? undefined;
+		const rr =
+			computeTradeRr({
+				profitMoney: grossProfit,
+				profitPercentage: profitPercentage ?? null,
+				nominal: account.nominal,
+				riskPercentage: DEFAULT_IMPORTED_RISK_PERCENTAGE,
+			}) ?? undefined;
+		const result = getTradeResult(pnl, account.nominal);
+
+		const data = {
+			symbol: p.symbol,
+			type: p.direction,
+			exitDate: p.exitDate,
+			profit: grossProfit,
+			grossProfit,
+			commission,
+			swap,
+			pnl,
+			profitPercentage,
+			rr,
+			result,
+			riskPercentage: DEFAULT_IMPORTED_RISK_PERCENTAGE,
+			fromTerminal: true,
+			terminalName: TERMINAL_NAME,
+			terminalTradeId,
+		};
+
+		await this.prisma.trade.upsert({
+			where: this.whereKey(account.userId, terminalTradeId),
+			create: {
+				...data,
+				quantity: p.quantity,
+				entryDate: p.entryDate,
+				tags: [],
+				user: { connect: { id: account.userId } },
+				tradingAccount: { connect: { id: account.tradingAccountId } },
+			},
+			update: data,
+		});
+		this.logger.log(
+			`backfill closed ${terminalTradeId} ${p.direction} ${p.symbol} pnl=${pnl} result=${result ?? '-'}`
 		);
 	}
 
