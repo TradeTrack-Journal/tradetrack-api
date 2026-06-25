@@ -5,7 +5,7 @@ import type { Env } from '../config';
 import { decrypt, encrypt } from '../crypto';
 import { PrismaService } from '../prisma';
 import { BackfillService } from './backfill.service';
-import { refreshAccessToken } from './ctrader-client';
+import { CtraderTokenRejectedError, refreshAccessToken } from './ctrader-client';
 import { CtraderConnection } from './ctrader-connection';
 import { CtraderTradeWriter } from './ctrader-trade-writer';
 import {
@@ -188,6 +188,12 @@ export class CtraderConnectionManager implements OnModuleInit, OnModuleDestroy {
 					this.logger.error(
 						`[${environment}] account ${account.ctidTraderAccountId} auth failed (skipped): ${describe(error)}`
 					);
+					// Dead refresh token: deactivate so reconcile stops retrying it forever. The user
+					// re-enables it by reconnecting (OAuth). Only on a definitive cTrader rejection —
+					// transient/decrypt failures are left active to retry.
+					if (error instanceof CtraderTokenRejectedError) {
+						await this.deactivateDeadToken(account);
+					}
 				}
 			}
 
@@ -492,9 +498,39 @@ export class CtraderConnectionManager implements OnModuleInit, OnModuleDestroy {
 		account.expiresAt = expiresAt;
 	}
 
+	/**
+	 * Flag a token inactive after cTrader definitively rejected its refresh token, so the next
+	 * reconcile stops loading + retrying it. Trades are untouched; the user re-enables the account by
+	 * reconnecting (OAuth), which writes a fresh token with isActive=true.
+	 */
+	private async deactivateDeadToken(account: PoolAccount): Promise<void> {
+		try {
+			await this.prisma.ctraderToken.update({
+				where: { id: account.tokenId },
+				data: { isActive: false },
+			});
+			this.logger.warn(
+				`[${account.environment}] deactivated token ${account.tokenId} (ctid ${account.ctidTraderAccountId}) — cTrader rejected its refresh token`
+			);
+		} catch (error) {
+			this.logger.error(`Failed to deactivate dead token ${account.tokenId}: ${describe(error)}`);
+		}
+	}
+
 	private async loadAccounts(): Promise<PoolAccount[]> {
+		// Optional staged-rollout / test scope: manage only these users' accounts (comma-separated ids).
+		const onlyUsers = process.env.CTRADER_ONLY_USER_IDS?.split(',')
+			.map((id) => id.trim())
+			.filter(Boolean);
+		if (onlyUsers?.length) {
+			this.logger.warn(`CTRADER_ONLY_USER_IDS set — managing only ${onlyUsers.length} user(s)`);
+		}
+
 		const tokens = await this.prisma.ctraderToken.findMany({
-			where: { isActive: true },
+			where: {
+				isActive: true,
+				...(onlyUsers?.length ? { tradingAccount: { userId: { in: onlyUsers } } } : {}),
+			},
 			select: {
 				id: true,
 				tradingAccountId: true,
