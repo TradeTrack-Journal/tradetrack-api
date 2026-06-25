@@ -203,7 +203,7 @@ export class BackfillService {
 					positionId,
 					symbolId: Number(raw.tradeData?.symbolId ?? 0),
 					volume: Number(raw.tradeData?.volume ?? 0),
-					side: Number(raw.tradeData?.tradeSide) === 2 ? 'SELL' : 'BUY',
+					side: normalizeSide(raw.tradeData?.tradeSide),
 					openTimestamp: Number(raw.tradeData?.openTimestamp ?? 0),
 				});
 			}
@@ -330,7 +330,7 @@ export class BackfillService {
 			symbolId: Number(d.symbolId ?? 0),
 			volume: Number(d.volume ?? 0),
 			filledVolume: Number(d.filledVolume ?? d.volume ?? 0),
-			side: Number(d.tradeSide) === 2 ? 'SELL' : 'BUY',
+			side: normalizeSide(d.tradeSide),
 			executionTimestamp: Number(d.executionTimestamp ?? 0),
 			createTimestamp: Number(d.createTimestamp ?? 0),
 			close: detail
@@ -347,6 +347,11 @@ export class BackfillService {
 		const ms = Number(timestamp ?? 0);
 		return ms > 0 ? new Date(ms) : new Date();
 	}
+}
+
+/** cTrader returns tradeSide as the enum NAME ('BUY'/'SELL'); tolerate the numeric form (1/2) too. */
+function normalizeSide(value: unknown): string {
+	return value === 'SELL' || Number(value) === 2 ? 'SELL' : 'BUY';
 }
 
 function invert(side: string): string {
