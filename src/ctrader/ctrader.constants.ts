@@ -37,3 +37,9 @@ export const TOKEN_REFRESH_SKEW_MS = 60_000;
 /** Fallback access-token lifetime when cTrader's refresh response omits expiresIn (avoids a
  *  zero-lifetime token that would otherwise refresh in a hot loop). */
 export const DEFAULT_TOKEN_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** Written to CtraderToken.deactivatedReason when this backend kills a token whose refresh token
+ *  cTrader rejected. The main app reads it to keep the returning user OFF auto-reactivation (the
+ *  token is dead — only a fresh OAuth reconnect revives it). Keep the literal in sync with the main
+ *  app's CtraderDeactivationReason.TOKEN_REJECTED. */
+export const DEAD_TOKEN_DEACTIVATION_REASON = 'TOKEN_REJECTED';

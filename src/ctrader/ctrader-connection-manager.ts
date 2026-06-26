@@ -9,6 +9,7 @@ import { CtraderTokenRejectedError, refreshAccessToken } from './ctrader-client'
 import { CtraderConnection } from './ctrader-connection';
 import { CtraderTradeWriter } from './ctrader-trade-writer';
 import {
+	DEAD_TOKEN_DEACTIVATION_REASON,
 	DEFAULT_TOKEN_LIFETIME_MS,
 	RECONCILE_INTERVAL_MS,
 	RECONNECT_BASE_DELAY_MS,
@@ -501,13 +502,14 @@ export class CtraderConnectionManager implements OnModuleInit, OnModuleDestroy {
 	/**
 	 * Flag a token inactive after cTrader definitively rejected its refresh token, so the next
 	 * reconcile stops loading + retrying it. Trades are untouched; the user re-enables the account by
-	 * reconnecting (OAuth), which writes a fresh token with isActive=true.
+	 * reconnecting (OAuth), which writes a fresh token with isActive=true. The reason keeps the main
+	 * app from auto-reactivating it on the user's return (a dead token would just be re-killed here).
 	 */
 	private async deactivateDeadToken(account: PoolAccount): Promise<void> {
 		try {
 			await this.prisma.ctraderToken.update({
 				where: { id: account.tokenId },
-				data: { isActive: false },
+				data: { isActive: false, deactivatedReason: DEAD_TOKEN_DEACTIVATION_REASON },
 			});
 			this.logger.warn(
 				`[${account.environment}] deactivated token ${account.tokenId} (ctid ${account.ctidTraderAccountId}) — cTrader rejected its refresh token`

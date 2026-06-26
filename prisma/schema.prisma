@@ -1047,6 +1047,10 @@ model CtraderToken {
   brokerName          String?
   accountNumber       String?
   isActive            Boolean        @default(true)
+  /// why isActive was turned off: 'INACTIVE' = paused by the stale-account cron (auto-reactivates
+  /// on return); 'TOKEN_REJECTED' = the always-on backend killed a dead refresh token (needs a
+  /// fresh OAuth reconnect); null = active, or paused before this column existed (non-reactivatable)
+  deactivatedReason   String?
   lastSyncAt          DateTime?
   lastConnectedAt     DateTime?
   createdAt           DateTime       @default(now())
