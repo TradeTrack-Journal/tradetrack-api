@@ -54,3 +54,30 @@ export const CONNECT_TIMEOUT_MS = 15_000;
 
 export const RECONNECT_BASE_DELAY_MS = 1_000;
 export const RECONNECT_MAX_DELAY_MS = 60_000;
+
+/** How often to reconcile live sessions with the DB (pick up newly connected / removed accounts). */
+export const RECONCILE_INTERVAL_MS = 30_000;
+
+/**
+ * How many times to re-attempt a close-history top-up when the report lagged the live `ClosePosition`
+ * (retried once per reconcile tick). After this the SyncEnd backfill on the next reconnect is the
+ * final backstop.
+ */
+export const CLOSE_TOPUP_MAX_RETRIES = 12;
+
+/** REST top-up (close-trades-history) tunables. */
+export const REST_TIMEOUT_MS = 20_000;
+/** Page size for the close-trades-history cursor (the report's own default is 200). */
+export const HISTORY_PAGE_LIMIT = 200;
+/** Bound the cursor walk so a huge history can't stall a reconnect or single-position top-up. */
+export const HISTORY_MAX_PAGES = 10;
+/**
+ * close-trades-history is rate-limited to ~5 requests / 10s, and ALL of a login's accounts share it.
+ * A global min-interval pacer (one gate across every account + page) keeps us safely under that.
+ */
+export const REST_MIN_INTERVAL_MS = 2_200;
+/** On HTTP 429, retry this many times honoring Retry-After (falls back to the delay below). */
+export const HISTORY_RATELIMIT_RETRIES = 2;
+export const HISTORY_RATELIMIT_DELAY_MS = 30_000;
+/** How long a cached user-level REST token is reused before re-logging in (TradeLocker JWTs outlive this). */
+export const USER_TOKEN_TTL_MS = 10 * 60_000;

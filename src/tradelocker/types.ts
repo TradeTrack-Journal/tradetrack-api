@@ -24,3 +24,48 @@ export interface PocAccountConfig {
 	/** Optional: pick this account's token from the issued list; falls back to the first. */
 	accountId?: string;
 }
+
+export type TradeSide = 'BUY' | 'SELL';
+
+/**
+ * Resolved persistence context for one streamed account — the DB identity the writer needs to key a
+ * Trade row. Sourced from the linked TradingAccount (Phase 3 manager); `nominal` drives the realized
+ * profit-% / R-multiple math exactly as the main app's cron does.
+ */
+export interface TradeLockerAccountContext {
+	userId: string;
+	tradingAccountId: string;
+	/** Account nominal (deposit) in account currency; 0 when unknown — money math degrades gracefully. */
+	nominal: number;
+}
+
+/**
+ * A normalized OPEN position taken from a live `Position` stream message. `quantity` is in UNITS (not
+ * lots) to match the main app's importer, which the stream provides directly as `units`.
+ */
+export interface OpenTrade {
+	positionId: string;
+	symbol: string;
+	side: TradeSide;
+	quantity: number;
+	entryDate: Date;
+}
+
+/**
+ * A normalized fully-realized CLOSED trade, sourced from REST `close-trades-history` (the live
+ * `ClosePosition` message carries no realized money). All monetary fields are absolute totals for the
+ * position, in account currency — the writer SETs them (idempotent), never accumulates.
+ */
+export interface ClosedTrade {
+	positionId: string;
+	symbol: string;
+	side: TradeSide;
+	quantity: number;
+	entryDate: Date;
+	exitDate: Date;
+	grossProfit: number;
+	commission: number;
+	swap: number;
+	/** Native net profit when the report provides it; else pnl falls back to gross + commission + swap. */
+	netProfit?: number;
+}

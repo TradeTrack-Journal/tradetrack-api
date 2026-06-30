@@ -29,6 +29,9 @@ const envSchema = z.object({
 	// Master switch for the TradeLocker Streams live-sync. The manager stays idle unless this is
 	// exactly 'true'. Keep it off until our production Streams API key is approved by TradeLocker.
 	TRADELOCKER_LIVE_SYNC_ENABLED: z.string().optional(),
+	// Staged-rollout / test scope: comma-separated user ids whose TradeLocker accounts the worker
+	// manages exclusively (mirrors CTRADER_ONLY_USER_IDS). Empty/unset = all tradelocker accounts.
+	TRADELOCKER_ONLY_USER_IDS: z.string().optional(),
 	// TradeLocker live-sync (Streams API). Optional so the service degrades gracefully (warn + idle)
 	// when absent. The developer-api-key is sent ONLY on the socket handshake (never on auth).
 	TRADELOCKER_DEVELOPER_API_KEY: z.string().optional(),
@@ -38,6 +41,11 @@ const envSchema = z.object({
 	// Override for the streams socket host (e.g. wss://api.tradelocker.com or wss://api-dev...).
 	// The developer-api-key is environment-scoped, so this must pair with the right key.
 	TRADELOCKER_STREAM_BASE_URL: z.string().optional(),
+
+	// Telegram notifications (reuses the main app's bot/chat). When both are set, the worker posts a
+	// one-off "live close captured" message to the same feedback chat. Unset = notifications skipped.
+	TELEGRAM_BOT_TOKEN: z.string().optional(),
+	TELEGRAM_FEEDBACK_CHAT_ID: z.string().optional(),
 
 	// PoC-only single-account override: connect one account from env instead of reading the DB.
 	TRADELOCKER_POC_EMAIL: z.string().optional(),

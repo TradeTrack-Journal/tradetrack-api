@@ -78,6 +78,65 @@ export async function authenticateAccounts(params: AuthParams): Promise<TradeLoc
 		}));
 }
 
+interface UserAuthParams {
+	/** Auth host, e.g. https://demo.tradelocker.com (NOT the socket host). */
+	baseUrl: string;
+	email: string;
+	password: string;
+	server: string;
+	/** developer-api-key — sent here (unlike the streams /accounts/tokens auth, which forbids it). */
+	developerApiKey?: string;
+}
+
+/**
+ * Issue a USER-LEVEL JWT via POST /backend-api/auth/jwt/token — the token the REST /trade/* endpoints
+ * accept. The per-account stream JWT from /accounts/tokens is rejected there with HTTP 400; the REST
+ * layer wants this user token plus an `accNum` header to pick the account, exactly as the main app's
+ * importer does. Returns the access token only (refresh isn't used — re-login is the refresh).
+ */
+export async function authenticateUser(params: UserAuthParams): Promise<string> {
+	const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+	if (params.developerApiKey) {
+		headers['developer-api-key'] = params.developerApiKey;
+	}
+
+	const response = await fetch(`${params.baseUrl}/backend-api/auth/jwt/token`, {
+		method: 'POST',
+		headers,
+		body: JSON.stringify({ email: params.email, password: params.password, server: params.server }),
+	});
+
+	const text = await response.text();
+	if (!response.ok) {
+		// Body is unvetted and the request carried credentials — truncate.
+		throw new Error(`TradeLocker REST auth failed: HTTP ${response.status} ${text.slice(0, 200)}`);
+	}
+	if (text.trim().startsWith('<')) {
+		throw new Error(
+			'TradeLocker REST auth returned HTML — check the auth host, server and environment.'
+		);
+	}
+
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(text);
+	} catch {
+		throw new Error('TradeLocker REST auth returned an invalid JSON response.');
+	}
+
+	const body = parsed as { accessToken?: unknown; data?: { accessToken?: unknown } };
+	const token =
+		typeof body.accessToken === 'string' && body.accessToken
+			? body.accessToken
+			: typeof body.data?.accessToken === 'string'
+				? body.data.accessToken
+				: '';
+	if (!token) {
+		throw new Error('TradeLocker REST auth response had no accessToken.');
+	}
+	return token;
+}
+
 /**
  * Best-effort decode of the `host` claim from a Streams JWT (no signature check). The host names the
  * account's backend cluster (e.g. bsb.tradelocker.com). The streams socket MUST belong to the same
