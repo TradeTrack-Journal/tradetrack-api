@@ -9,6 +9,8 @@ import { authenticateAccounts, authenticateUser } from './client';
 import { TradeLockerConnection, TradeLockerSubscribeError } from './connection';
 import {
 	CLOSE_TOPUP_MAX_RETRIES,
+	PERIODIC_BACKFILL_INTERVAL_MS,
+	PERIODIC_BACKFILL_MAX_PAGES,
 	RECONCILE_INTERVAL_MS,
 	RECONNECT_BASE_DELAY_MS,
 	RECONNECT_MAX_DELAY_MS,
@@ -55,6 +57,8 @@ interface AccountSession {
 	reconnectTimer?: NodeJS.Timeout;
 	/** Bumped on every (re)connect; lets a superseded attempt detect it lost ownership. */
 	generation: number;
+	/** Epoch ms of the last close-history backfill; gates the periodic safety-net scan. */
+	lastBackfillAt?: number;
 }
 
 /**
@@ -86,6 +90,13 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnAppli
 	>();
 	/** Positions whose REST finalization is in flight, so a duplicate close can't double-fetch/write. */
 	private readonly finalizingCloses = new Set<string>();
+	/**
+	 * Positions already finalized as closed this process (closeKey). Lets the periodic backfill skip
+	 * re-upserting an unchanged realized row, and lets a live close short-circuit when a backfill
+	 * already captured it. Grows with realized volume over the process lifetime — bounded in practice
+	 * and reset on restart.
+	 */
+	private readonly closedSeen = new Set<string>();
 	/** Global pacer for ALL close-history requests — one login's accounts share the 5-req/10s limit. */
 	private readonly restPacer = createPacer(REST_MIN_INTERVAL_MS);
 	private developerApiKey = '';
@@ -94,6 +105,8 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnAppli
 	private reconciling = false;
 	/** Fire the "live close captured" Telegram ping only once per process. */
 	private liveCloseNotified = false;
+	/** Log the ONLY_USER_IDS scope note once, not on every reconcile tick's loadAccounts(). */
+	private onlyUsersLogged = false;
 
 	constructor(
 		private readonly config: ConfigService<Env, true>,
@@ -122,6 +135,7 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnAppli
 		}
 		this.sessions.clear();
 		this.pendingCloses.clear();
+		this.closedSeen.clear();
 	}
 
 	private async start(): Promise<void> {
@@ -156,7 +170,14 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnAppli
 	}
 
 	private startAccount(account: ManagedAccount): void {
-		const session: AccountSession = { account, reconnectAttempt: 0, generation: 0 };
+		// Seed the backfill clock so the periodic net waits a full interval — the initial SyncEnd
+		// backfill covers the account's existing history right after it connects.
+		const session: AccountSession = {
+			account,
+			reconnectAttempt: 0,
+			generation: 0,
+			lastBackfillAt: Date.now(),
+		};
 		this.sessions.set(account.tradingAccountId, session);
 		this.logger.log(
 			`connecting account ${account.accountId} (user ${account.userId}, env ${account.environment})`
@@ -302,6 +323,8 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnAppli
 	private handleSyncEnd(session: AccountSession): void {
 		this.logger.log(`[${session.account.accountId}] SyncEnd — backfilling recent closed trades`);
 		// Catch closes that happened during downtime (the open snapshot only carries OPEN positions).
+		// This resets the periodic clock — a fresh reconnect just did a full scan.
+		session.lastBackfillAt = Date.now();
 		void this.backfillCloses(session).catch((error) =>
 			this.logger.error(`[${session.account.accountId}] close backfill failed: ${describe(error)}`)
 		);
@@ -309,22 +332,29 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnAppli
 
 	/** Fetch the realized row for a position and finalize the Trade. Returns true once written. */
 	private async finalizeClose(session: AccountSession, positionId: string): Promise<boolean> {
-		const rest = await this.restParamsFor(session);
-		if (!rest) {
-			return false;
-		}
 		const key = this.closeKey(session, positionId);
+		if (this.closedSeen.has(key)) {
+			this.pendingCloses.delete(key);
+			return true; // a backfill already finalized this position — nothing left to fetch/write
+		}
 		if (this.finalizingCloses.has(key)) {
 			return false; // a finalize is already running for this position (duplicate close / retry overlap)
 		}
+		// Claim the position synchronously (no await between has() and add()) so two concurrent finalizes
+		// — a live close top-up and a retry tick — can't both slip past the guard and double-fetch/write.
 		this.finalizingCloses.add(key);
 		try {
+			const rest = await this.restParamsFor(session);
+			if (!rest) {
+				return false;
+			}
 			const closed = await fetchClosedTrades({ ...rest, untilPositionId: positionId });
 			const match = closed.find((c) => c.positionId === positionId);
 			if (!match) {
 				return false;
 			}
 			await this.writer.recordClosed(this.context(session.account), match);
+			this.closedSeen.add(key);
 			this.pendingCloses.delete(key);
 			// finalizeClose only ever runs for a LIVE close (ClosePosition event or its retry) — backfill
 			// writes directly — so this is the signal that the live close path worked end-to-end.
@@ -382,21 +412,36 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnAppli
 		}
 	}
 
-	/** Bounded pull of recent realized trades, finalizing each (idempotent). */
-	private async backfillCloses(session: AccountSession): Promise<void> {
+	/**
+	 * Bounded pull of recent realized trades, finalizing each. Skips positions already finalized this
+	 * process so the periodic net doesn't re-upsert an unchanged report page every few minutes.
+	 * `maxPages` bounds the walk — the periodic scan passes 1 (only the newest closes can be recent
+	 * misses); SyncEnd uses the deeper default to also cover closes that happened during downtime.
+	 */
+	private async backfillCloses(session: AccountSession, maxPages?: number): Promise<void> {
 		const rest = await this.restParamsFor(session);
 		if (!rest) {
 			return;
 		}
-		const closed = await fetchClosedTrades(rest);
+		const closed = await fetchClosedTrades(maxPages ? { ...rest, maxPages } : rest);
 		const ctx = this.context(session.account);
+		let written = 0;
 		for (const trade of closed) {
+			const key = this.closeKey(session, trade.positionId);
+			if (this.closedSeen.has(key) || this.finalizingCloses.has(key)) {
+				// Already finalized (authoritative row won't change), or a live finalize is mid-flight for
+				// it — skip to avoid a duplicate upsert. If that finalize fails it re-queues via
+				// pendingCloses / the next periodic scan, so skipping here never drops a close.
+				continue;
+			}
 			await this.writer.recordClosed(ctx, trade);
-			this.pendingCloses.delete(this.closeKey(session, trade.positionId));
+			this.closedSeen.add(key);
+			this.pendingCloses.delete(key);
+			written += 1;
 		}
-		if (closed.length > 0) {
+		if (written > 0) {
 			this.logger.log(
-				`[${session.account.accountId}] backfilled ${closed.length} closed trade(s) from REST`
+				`[${session.account.accountId}] backfilled ${written} closed trade(s) from REST`
 			);
 		}
 	}
@@ -568,6 +613,25 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnAppli
 					this.startAccount(account);
 				}
 			}
+
+			// Safety-net backfill: independently of reconnect/SyncEnd, re-scan the newest close-history
+			// page for each live session so a close whose live `ClosePosition` never arrived (silent
+			// socket, no drop → no reconnect) is still captured. Bounded to one page and funnelled
+			// through restPacer; closedSeen makes it a no-op when nothing was missed. Fire-and-forget so
+			// a slow login can't stall the reconcile loop; the clock is set up-front so the next tick
+			// won't double-fire.
+			const now = Date.now();
+			for (const session of this.sessions.values()) {
+				if (now - (session.lastBackfillAt ?? 0) < PERIODIC_BACKFILL_INTERVAL_MS) {
+					continue;
+				}
+				session.lastBackfillAt = now;
+				void this.backfillCloses(session, PERIODIC_BACKFILL_MAX_PAGES).catch((error) =>
+					this.logger.error(
+						`[${session.account.accountId}] periodic backfill failed: ${describe(error)}`
+					)
+				);
+			}
 		} catch (error) {
 			this.logger.error(`reconcile failed: ${describe(error)}`);
 		} finally {
@@ -597,7 +661,8 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnAppli
 			?.split(',')
 			.map((id) => id.trim())
 			.filter(Boolean);
-		if (onlyUsers?.length) {
+		if (onlyUsers?.length && !this.onlyUsersLogged) {
+			this.onlyUsersLogged = true;
 			this.logger.warn(`TRADELOCKER_ONLY_USER_IDS set — managing only ${onlyUsers.length} user(s)`);
 		}
 

@@ -81,3 +81,14 @@ export const HISTORY_RATELIMIT_RETRIES = 2;
 export const HISTORY_RATELIMIT_DELAY_MS = 30_000;
 /** How long a cached user-level REST token is reused before re-logging in (TradeLocker JWTs outlive this). */
 export const USER_TOKEN_TTL_MS = 10 * 60_000;
+
+/**
+ * Safety-net backfill cadence. Independently of reconnect/SyncEnd, every live session re-scans the
+ * newest page of close-trades-history this often, so a close whose live `ClosePosition` was never
+ * delivered (a silently degraded socket that never drops → no reconnect → no SyncEnd) is still
+ * captured within minutes instead of hanging open until the next reconnect. Deduped by the
+ * in-process finalized-set, so it's a no-op when nothing was missed.
+ */
+export const PERIODIC_BACKFILL_INTERVAL_MS = 3 * 60_000;
+/** Only the newest page matters for the periodic net — a recent miss sits at the top of the report. */
+export const PERIODIC_BACKFILL_MAX_PAGES = 1;
