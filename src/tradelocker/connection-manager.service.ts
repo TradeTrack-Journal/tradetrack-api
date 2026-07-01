@@ -5,23 +5,28 @@ import * as Sentry from '@sentry/nestjs';
 import type { Env } from '../config';
 import { decrypt } from '../crypto';
 import { PrismaService } from '../prisma';
+import { getTradeResult } from '../trades';
 import { authenticateAccounts, authenticateUser } from './client';
 import { TradeLockerConnection, TradeLockerSubscribeError } from './connection';
 import {
 	CLOSE_TOPUP_MAX_RETRIES,
+	HISTORY_MAX_PAGES,
+	HISTORY_PAGE_LIMIT,
+	OPEN_PNL_UPDATE_INTERVAL_MS,
 	PERIODIC_BACKFILL_INTERVAL_MS,
 	PERIODIC_BACKFILL_MAX_PAGES,
 	RECONCILE_INTERVAL_MS,
 	RECONNECT_BASE_DELAY_MS,
 	RECONNECT_MAX_DELAY_MS,
 	REST_MIN_INTERVAL_MS,
+	TERMINAL_NAME,
 	TRADELOCKER_AUTH_HOSTS,
 	TRADELOCKER_STREAM_HOSTS,
 	USER_TOKEN_TTL_MS,
 } from './constants';
 import { fetchClosedTrades, type FetchClosedTradesParams } from './history';
 import { sendTelegramMessage } from './telegram';
-import type { ClosePositionMessage, PositionMessage } from './stream.schema';
+import type { AccountStatusMessage, ClosePositionMessage, PositionMessage } from './stream.schema';
 import { TradeWriterService } from './trade-writer.service';
 import type {
 	ClosedTrade,
@@ -59,6 +64,12 @@ interface AccountSession {
 	generation: number;
 	/** Epoch ms of the last close-history backfill; gates the periodic safety-net scan. */
 	lastBackfillAt?: number;
+	/** True once the initial snapshot finished (SyncEnd); only opens AFTER this are genuinely new. */
+	synced?: boolean;
+	/** positionIds seen this session — notify only first-seen opens, not snapshot re-sends/modifications. */
+	seenOpens?: Set<string>;
+	/** Per-position epoch ms of the last unrealized-pnl write; throttles the frequent AccountStatus ticks. */
+	pnlWriteAt?: Map<string, number>;
 }
 
 /**
@@ -97,14 +108,14 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnAppli
 	 * and reset on restart.
 	 */
 	private readonly closedSeen = new Set<string>();
+	/** Accounts whose already-stored closes have been loaded into closedSeen (primed once each). */
+	private readonly primedAccounts = new Set<string>();
 	/** Global pacer for ALL close-history requests — one login's accounts share the 5-req/10s limit. */
 	private readonly restPacer = createPacer(REST_MIN_INTERVAL_MS);
 	private developerApiKey = '';
 	private stopped = false;
 	private reconcileTimer?: NodeJS.Timeout;
 	private reconciling = false;
-	/** Fire the "live close captured" Telegram ping only once per process. */
-	private liveCloseNotified = false;
 	/** Log the ONLY_USER_IDS scope note once, not on every reconcile tick's loadAccounts(). */
 	private onlyUsersLogged = false;
 
@@ -136,6 +147,7 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnAppli
 		this.sessions.clear();
 		this.pendingCloses.clear();
 		this.closedSeen.clear();
+		this.primedAccounts.clear();
 	}
 
 	private async start(): Promise<void> {
@@ -177,6 +189,8 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnAppli
 			reconnectAttempt: 0,
 			generation: 0,
 			lastBackfillAt: Date.now(),
+			synced: false,
+			seenOpens: new Set(),
 		};
 		this.sessions.set(account.tradingAccountId, session);
 		this.logger.log(
@@ -193,6 +207,11 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnAppli
 			return;
 		}
 		const generation = ++session.generation;
+		// Fresh (re)connect: the broker re-sends the open snapshot before SyncEnd, so reset the snapshot
+		// guards — opens during the snapshot must NOT notify, only genuinely-new ones after it.
+		session.synced = false;
+		session.seenOpens = new Set();
+		session.pnlWriteAt = new Map();
 		const superseded = (): boolean =>
 			this.stopped ||
 			this.sessions.get(session.account.tradingAccountId) !== session ||
@@ -227,7 +246,7 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnAppli
 				this.developerApiKey,
 				this.logger,
 				{
-					onAccountStatus: () => undefined, // unrealized balances aren't persisted
+					onAccountStatus: (m) => this.handleAccountStatus(session, m),
 					onOpenOrder: () => undefined, // positions, not orders, drive Trade rows
 					onPosition: (m) => this.handlePosition(session, m),
 					onClosePosition: (m) => this.handleClose(session, m),
@@ -305,11 +324,58 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnAppli
 
 	private handlePosition(session: AccountSession, msg: PositionMessage): void {
 		const open = mapOpenTrade(msg);
+		// Notify only a genuinely-new open: first time we see this positionId AND after the initial
+		// snapshot (SyncEnd). Snapshot re-sends (every reconnect) and position modifications don't fire.
+		const seen = (session.seenOpens ??= new Set());
+		const notifyNewOpen = session.synced === true && !seen.has(msg.positionId);
+		seen.add(msg.positionId);
 		void this.writer
 			.recordOpen(this.context(session.account), open)
+			.then(() => {
+				if (notifyNewOpen) {
+					this.notifyOpen(session.account, open);
+				}
+			})
 			.catch((error) =>
 				this.logger.error(`[${session.account.accountId}] open write failed: ${describe(error)}`)
 			);
+	}
+
+	/**
+	 * Refresh open positions' floating (unrealized) P&L from `AccountStatus.positionPnLs`. The stream
+	 * pushes this on every tick, so writes are throttled per position (OPEN_PNL_UPDATE_INTERVAL_MS). The
+	 * writer is update-only: it never creates a row (opens come from the `Position` handler) and never
+	 * touches a closed one — so a pnl entry for a not-yet-created or already-closed position is a no-op.
+	 */
+	private handleAccountStatus(session: AccountSession, msg: AccountStatusMessage): void {
+		const pnls = msg.positionPnLs;
+		if (!pnls?.length) {
+			return;
+		}
+		const now = Date.now();
+		const writeAt = (session.pnlWriteAt ??= new Map<string, number>());
+		const ctx = this.context(session.account);
+		for (const { positionId, pnl } of pnls) {
+			const last = writeAt.get(positionId);
+			if (last !== undefined && now - last < OPEN_PNL_UPDATE_INTERVAL_MS) {
+				continue; // written recently — skip this tick
+			}
+			const unrealized = Number(pnl);
+			if (!Number.isFinite(unrealized)) {
+				continue;
+			}
+			// Stamp before the async write so a burst of ticks can't queue duplicate writes for one position.
+			// A failed write keeps its stamp (logged, retried only next window, not this tick) — deliberate:
+			// that backs off instead of hammering an already-struggling DB, and floating pnl self-corrects.
+			writeAt.set(positionId, now);
+			void this.writer
+				.recordUnrealized(ctx, positionId, unrealized)
+				.catch((error) =>
+					this.logger.error(
+						`[${session.account.accountId}] unrealized update failed for ${positionId}: ${describe(error)}`
+					)
+				);
+		}
 	}
 
 	private handleClose(session: AccountSession, msg: ClosePositionMessage): void {
@@ -322,6 +388,8 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnAppli
 
 	private handleSyncEnd(session: AccountSession): void {
 		this.logger.log(`[${session.account.accountId}] SyncEnd — backfilling recent closed trades`);
+		// Snapshot done — Position messages after this are genuinely-new opens (worth notifying).
+		session.synced = true;
 		// Catch closes that happened during downtime (the open snapshot only carries OPEN positions).
 		// This resets the periodic clock — a fresh reconnect just did a full scan.
 		session.lastBackfillAt = Date.now();
@@ -357,8 +425,8 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnAppli
 			this.closedSeen.add(key);
 			this.pendingCloses.delete(key);
 			// finalizeClose only ever runs for a LIVE close (ClosePosition event or its retry) — backfill
-			// writes directly — so this is the signal that the live close path worked end-to-end.
-			this.notifyFirstLiveClose(session.account, match);
+			// writes directly — so notify here fires on real live closes, not the historical re-sync.
+			this.notifyClose(session.account, match);
 			return true;
 		} finally {
 			this.finalizingCloses.delete(key);
@@ -423,6 +491,9 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnAppli
 		if (!rest) {
 			return;
 		}
+		// Load what's already stored so a reconnect/deploy re-scan writes only NEW or previously-missed
+		// closes, not the whole (bounded) history again.
+		await this.primeClosedSeen(session);
 		const closed = await fetchClosedTrades(maxPages ? { ...rest, maxPages } : rest);
 		const ctx = this.context(session.account);
 		let written = 0;
@@ -446,44 +517,73 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnAppli
 		}
 	}
 
+	/**
+	 * Prime `closedSeen` with the account's already-stored closes the first time we manage it, so a
+	 * reconnect/deploy re-scan re-writes nothing already in the DB — only genuinely new (or a
+	 * still-OPEN position whose close was missed) rows get finalized. OPEN rows are deliberately NOT
+	 * primed, so a stuck-open position is still finalized by the backfill. Bounded to the deepest page
+	 * the backfill can reach so a huge history can't blow up the query.
+	 */
+	private async primeClosedSeen(session: AccountSession): Promise<void> {
+		const id = session.account.tradingAccountId;
+		if (this.primedAccounts.has(id)) {
+			return;
+		}
+		const rows = await this.prisma.trade.findMany({
+			where: { tradingAccountId: id, terminalName: TERMINAL_NAME, exitDate: { not: null } },
+			select: { terminalTradeId: true },
+			orderBy: { exitDate: 'desc' },
+			take: HISTORY_MAX_PAGES * HISTORY_PAGE_LIMIT,
+		});
+		for (const row of rows) {
+			if (row.terminalTradeId) {
+				this.closedSeen.add(this.closeKey(session, row.terminalTradeId));
+			}
+		}
+		this.primedAccounts.add(id); // after load, so a failed query re-primes next time
+	}
+
 	private closeKey(session: AccountSession, positionId: string): string {
 		return `${session.account.tradingAccountId}:${positionId}`;
 	}
 
 	/**
-	 * Post a one-off "live close captured" Telegram ping (same bot/chat as the main app) the first time
-	 * the live close path finalizes a trade — confirmation that the stream→REST→write chain works in
-	 * prod. Best-effort and fire-and-forget; claims the flag synchronously to avoid a double-send race
-	 * and resets it only if the send fails, so a transient failure still notifies on the next close.
+	 * Live open/close Telegram notifications (same bot/chat as the main app). Fire-and-forget and
+	 * best-effort; a no-op when the two env vars aren't set. Opens are gated to genuinely-new positions
+	 * by the caller; closes fire only from the LIVE finalize path (never the historical backfill).
 	 */
-	private notifyFirstLiveClose(account: ManagedAccount, closed: ClosedTrade): void {
-		if (this.liveCloseNotified) {
-			return;
-		}
-		this.liveCloseNotified = true;
+	private notifyOpen(account: ManagedAccount, open: OpenTrade): void {
+		this.sendTelegram(
+			`🟢 <b>Угода відкрита</b>\n` +
+				`Account: <code>${account.accountId}</code>\n` +
+				`Position: <code>${open.positionId}</code>\n` +
+				`${open.side} ${open.symbol} qty=${open.quantity}`
+		);
+	}
 
+	private notifyClose(account: ManagedAccount, closed: ClosedTrade): void {
+		const net = closed.netProfit ?? closed.grossProfit + closed.commission + closed.swap;
+		const result = getTradeResult(net, account.nominal);
+		const icon = net >= 0 ? '🟢' : '🔴';
+		this.sendTelegram(
+			`${icon} <b>Угода закрита</b>${result ? ` (${result})` : ''}\n` +
+				`Account: <code>${account.accountId}</code>\n` +
+				`Position: <code>${closed.positionId}</code>\n` +
+				`${closed.side} ${closed.symbol} qty=${closed.quantity}\n` +
+				`PnL(net): ${net}`
+		);
+	}
+
+	/** Best-effort fire-and-forget send to the shared bot/chat; no-op when Telegram env isn't configured. */
+	private sendTelegram(text: string): void {
 		const botToken = this.config.get('TELEGRAM_BOT_TOKEN', { infer: true })?.trim();
 		const chatId = this.config.get('TELEGRAM_FEEDBACK_CHAT_ID', { infer: true })?.trim();
 		if (!botToken || !chatId) {
-			this.logger.log('Live close captured (Telegram not configured — ping skipped).');
-			return; // stays "notified" so we don't recheck every close
+			return; // notifications disabled
 		}
-
-		const net = closed.netProfit ?? closed.grossProfit + closed.commission + closed.swap;
-		const text =
-			`✅ <b>TradeLocker live-sync</b>\n` +
-			`Перше живе закриття опрацьовано та записано в Trade.\n` +
-			`Account: <code>${account.accountId}</code> (user <code>${account.userId}</code>)\n` +
-			`Position: <code>${closed.positionId}</code>\n` +
-			`${closed.side} ${closed.symbol} qty=${closed.quantity}\n` +
-			`PnL(net): ${net}`;
-
 		void sendTelegramMessage({ botToken, chatId, text }).then((ok) => {
-			if (ok) {
-				this.logger.log(`Live close captured — Telegram ping sent (pos ${closed.positionId}).`);
-			} else {
-				this.liveCloseNotified = false; // let the next live close retry the notification
-				this.logger.warn('Live close Telegram ping failed — will retry on the next live close.');
+			if (!ok) {
+				this.logger.warn('Telegram notification failed to send.');
 			}
 		});
 	}
@@ -669,6 +769,10 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnAppli
 		const rows = await this.prisma.tradingAccount.findMany({
 			where: {
 				terminalType: 'tradelocker',
+				// Archived accounts are dead history — never stream or backfill them. `isArchived` is a
+				// non-nullable Boolean, so a direct `false` filter is safe (no NULL three-valued-logic trap).
+				// Un-archiving flips it back and reconcile picks the account up on the next tick.
+				isArchived: false,
 				...(onlyUsers?.length ? { userId: { in: onlyUsers } } : {}),
 			},
 			select: {

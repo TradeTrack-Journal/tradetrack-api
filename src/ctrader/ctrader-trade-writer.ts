@@ -178,13 +178,16 @@ export class CtraderTradeWriter {
 		// arrive as separate deals). Safe to read-then-write: writes for one position are serialized.
 		const existing = await this.prisma.trade.findUnique({
 			where: this.whereKey(account.userId, terminalTradeId),
-			select: { grossProfit: true, commission: true, swap: true },
+			select: { grossProfit: true, commission: true, swap: true, riskPercentage: true },
 		});
 
 		const grossProfit = roundMoney((existing?.grossProfit ?? 0) + t.grossProfit);
 		const commission = roundMoney((existing?.commission ?? 0) + t.commission);
 		const swap = roundMoney((existing?.swap ?? 0) + t.swap);
 		const pnl = roundMoney(grossProfit + commission + swap);
+		// Risk % is a user-owned input (terminals never report it) — preserve a manually-set value
+		// across re-syncs / partial closes and only default a brand-new row, deriving rr from it.
+		const riskPercentage = existing?.riskPercentage ?? DEFAULT_IMPORTED_RISK_PERCENTAGE;
 		const profitPercentage =
 			computeProfitPercentageFromMoney(grossProfit, account.nominal) ?? undefined;
 		const rr =
@@ -192,7 +195,7 @@ export class CtraderTradeWriter {
 				profitMoney: grossProfit,
 				profitPercentage: profitPercentage ?? null,
 				nominal: account.nominal,
-				riskPercentage: DEFAULT_IMPORTED_RISK_PERCENTAGE,
+				riskPercentage,
 			}) ?? undefined;
 		// Stay open (no exitDate / result) until the position is fully closed.
 		const exitDate = t.fullyClosed ? t.exitDate : null;
@@ -210,7 +213,7 @@ export class CtraderTradeWriter {
 			profitPercentage,
 			rr,
 			result,
-			riskPercentage: DEFAULT_IMPORTED_RISK_PERCENTAGE,
+			riskPercentage,
 			fromTerminal: true,
 			terminalName: TERMINAL_NAME,
 			terminalTradeId,
@@ -250,6 +253,13 @@ export class CtraderTradeWriter {
 		}
 
 		// Fully closed → SET the absolute realized values (idempotent across re-runs / reconnects).
+		// Risk % is user-owned — preserve an existing (possibly hand-edited) value, default only a new
+		// row, and derive rr from it, so a reconnect/backfill re-run never clobbers a manual risk edit.
+		const existing = await this.prisma.trade.findUnique({
+			where: this.whereKey(account.userId, terminalTradeId),
+			select: { riskPercentage: true },
+		});
+		const riskPercentage = existing?.riskPercentage ?? DEFAULT_IMPORTED_RISK_PERCENTAGE;
 		const grossProfit = roundMoney(p.grossProfit);
 		const commission = roundMoney(p.commission);
 		const swap = roundMoney(p.swap);
@@ -261,7 +271,7 @@ export class CtraderTradeWriter {
 				profitMoney: grossProfit,
 				profitPercentage: profitPercentage ?? null,
 				nominal: account.nominal,
-				riskPercentage: DEFAULT_IMPORTED_RISK_PERCENTAGE,
+				riskPercentage,
 			}) ?? undefined;
 		const result = getTradeResult(pnl, account.nominal);
 
@@ -277,7 +287,7 @@ export class CtraderTradeWriter {
 			profitPercentage,
 			rr,
 			result,
-			riskPercentage: DEFAULT_IMPORTED_RISK_PERCENTAGE,
+			riskPercentage,
 			fromTerminal: true,
 			terminalName: TERMINAL_NAME,
 			terminalTradeId,

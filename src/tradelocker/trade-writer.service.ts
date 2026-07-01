@@ -44,6 +44,22 @@ export class TradeWriterService {
 		await this.serialize(ctx.userId, closed.positionId, () => this.writeClosed(ctx, closed));
 	}
 
+	/**
+	 * Refresh the unrealized (floating) P&L of an OPEN position from a live `AccountStatus.positionPnLs`
+	 * entry. Update-only: never CREATES a row (the stream pnl entry has no symbol/side/qty to build one —
+	 * the `Position` handler owns creation) and never touches a CLOSED row (the realized close wins).
+	 * Mirrors the main app's open-position merge so the row is numerically identical to a cron-written one.
+	 */
+	async recordUnrealized(
+		ctx: TradeLockerAccountContext,
+		positionId: string,
+		unrealizedPl: number
+	): Promise<void> {
+		await this.serialize(ctx.userId, positionId, () =>
+			this.writeUnrealized(ctx, positionId, unrealizedPl)
+		);
+	}
+
 	/** Run task on the per-position serialization chain so concurrent writes can't clobber each other. */
 	private serialize(userId: string, positionId: string, task: () => Promise<void>): Promise<void> {
 		const key = `${userId}:${positionId}`;
@@ -96,13 +112,24 @@ export class TradeWriterService {
 		// app's TradeLocker importer persists as `profit` AND `pnl`, and derives %/R/result from (its
 		// adapter sets profit = pnl = net), UNLIKE cTrader where `profit` is the gross figure.
 		const pnl = roundMoney(closed.netProfit ?? grossProfit + commission + swap);
+		// Risk % is a user-owned input (terminals never report it) — a manually-set value MUST survive
+		// re-finalization (every backfill/live re-close runs this). Preserve an existing value and only
+		// default a brand-new row, exactly like the main app's buildUpdatePayload. On upsert-create
+		// `existing` is null ⇒ DEFAULT; on update it's the stored (possibly hand-edited) value. RR is
+		// then derived from the PRESERVED risk so it stays consistent. Read runs inside the per-position
+		// serialize chain, so no other write for this position interleaves.
+		const existing = await this.prisma.trade.findUnique({
+			where: this.whereKey(ctx.userId, closed.positionId),
+			select: { riskPercentage: true },
+		});
+		const riskPercentage = existing?.riskPercentage ?? DEFAULT_IMPORTED_RISK_PERCENTAGE;
 		const profitPercentage = computeProfitPercentageFromMoney(pnl, ctx.nominal) ?? undefined;
 		const rr =
 			computeTradeRr({
 				profitMoney: pnl,
 				profitPercentage: profitPercentage ?? null,
 				nominal: ctx.nominal,
-				riskPercentage: DEFAULT_IMPORTED_RISK_PERCENTAGE,
+				riskPercentage,
 			}) ?? undefined;
 		const result = getTradeResult(pnl, ctx.nominal);
 
@@ -120,7 +147,7 @@ export class TradeWriterService {
 			profitPercentage,
 			rr,
 			result,
-			riskPercentage: DEFAULT_IMPORTED_RISK_PERCENTAGE,
+			riskPercentage,
 			fromTerminal: true,
 			terminalName: TERMINAL_NAME,
 			terminalTradeId: closed.positionId,
@@ -142,6 +169,45 @@ export class TradeWriterService {
 		this.logger.log(
 			`closed ${closed.positionId} ${closed.side} ${closed.symbol} pnl=${pnl} result=${result ?? '-'}`
 		);
+	}
+
+	private async writeUnrealized(
+		ctx: TradeLockerAccountContext,
+		positionId: string,
+		unrealizedPl: number
+	): Promise<void> {
+		// Risk % is user-owned — read the existing row to preserve it (and to confirm the row exists and is
+		// still open before writing). No open row yet ⇒ the `Position` handler hasn't created it; skip and
+		// the next AccountStatus tick catches it once it exists.
+		const existing = await this.prisma.trade.findUnique({
+			where: this.whereKey(ctx.userId, positionId),
+			select: { exitDate: true, riskPercentage: true },
+		});
+		if (!existing || existing.exitDate !== null) {
+			return; // no open row to update, or already closed (the realized close is authoritative)
+		}
+		// Store the raw unrealized figure (already in account currency) and derive %/RR from it — exactly
+		// like the main app's mergeOpenPositions, so the floating R-multiple matches a cron-written row.
+		const riskPercentage = existing.riskPercentage ?? DEFAULT_IMPORTED_RISK_PERCENTAGE;
+		const profitPercentage = computeProfitPercentageFromMoney(unrealizedPl, ctx.nominal) ?? null;
+		const rr =
+			computeTradeRr({
+				profitMoney: unrealizedPl,
+				profitPercentage,
+				nominal: ctx.nominal,
+				riskPercentage,
+			}) ?? null;
+		// exitDate:null in the where makes the write atomically skip a close that landed between the read
+		// and here, and updateMany no-ops (rather than throwing) if the row just vanished.
+		await this.prisma.trade.updateMany({
+			where: {
+				userId: ctx.userId,
+				terminalName: TERMINAL_NAME,
+				terminalTradeId: positionId,
+				exitDate: null,
+			},
+			data: { pnl: unrealizedPl, profitPercentage, rr, riskPercentage },
+		});
 	}
 
 	private whereKey(userId: string, positionId: string) {

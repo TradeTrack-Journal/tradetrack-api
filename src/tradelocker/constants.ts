@@ -92,3 +92,11 @@ export const USER_TOKEN_TTL_MS = 10 * 60_000;
 export const PERIODIC_BACKFILL_INTERVAL_MS = 3 * 60_000;
 /** Only the newest page matters for the periodic net — a recent miss sits at the top of the report. */
 export const PERIODIC_BACKFILL_MAX_PAGES = 1;
+
+/**
+ * Throttle for unrealized-P&L updates of OPEN positions. `AccountStatus` streams on every tick, so an
+ * open position's floating pnl/%/RR is refreshed at most this often (per position) instead of on every
+ * frame — keeps the write rate low while still showing a live R-multiple, mirroring the main app's
+ * per-sync open-position merge.
+ */
+export const OPEN_PNL_UPDATE_INTERVAL_MS = 30_000;
