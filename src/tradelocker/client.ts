@@ -16,6 +16,27 @@ interface RawAccountToken {
 }
 
 /**
+ * Thrown when a TradeLocker auth endpoint answers with a non-ok HTTP status. `fatal` distinguishes
+ * "these credentials/this account are rejected" (the caller may deactivate the integration, exactly
+ * like the main app's cron did) from transient broker trouble (429/5xx/network), which must only
+ * back off and retry — never deactivate.
+ */
+export class TradeLockerAuthError extends Error {
+	constructor(
+		message: string,
+		readonly status: number
+	) {
+		super(message);
+		this.name = 'TradeLockerAuthError';
+	}
+
+	/** 400/401/403 = credentials or account rejected by the broker; everything else is transient. */
+	get fatal(): boolean {
+		return this.status === 400 || this.status === 401 || this.status === 403;
+	}
+}
+
+/**
  * Issue per-account stream JWTs via POST /backend-api/auth/jwt/accounts/tokens.
  *
  * Differences from the main app's REST importer (intentional, confirmed against the streams example):
@@ -40,7 +61,10 @@ export async function authenticateAccounts(params: AuthParams): Promise<TradeLoc
 
 	if (!response.ok) {
 		// Body is unvetted and the request carried credentials — truncate.
-		throw new Error(`TradeLocker auth failed: HTTP ${response.status} ${text.slice(0, 200)}`);
+		throw new TradeLockerAuthError(
+			`TradeLocker auth failed: HTTP ${response.status} ${text.slice(0, 200)}`,
+			response.status
+		);
 	}
 
 	if (text.trim().startsWith('<')) {
@@ -109,7 +133,10 @@ export async function authenticateUser(params: UserAuthParams): Promise<string> 
 	const text = await response.text();
 	if (!response.ok) {
 		// Body is unvetted and the request carried credentials — truncate.
-		throw new Error(`TradeLocker REST auth failed: HTTP ${response.status} ${text.slice(0, 200)}`);
+		throw new TradeLockerAuthError(
+			`TradeLocker REST auth failed: HTTP ${response.status} ${text.slice(0, 200)}`,
+			response.status
+		);
 	}
 	if (text.trim().startsWith('<')) {
 		throw new Error(

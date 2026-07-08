@@ -6,7 +6,7 @@ import type { Env } from '../config';
 import { decrypt } from '../crypto';
 import { PrismaService } from '../prisma';
 import { getTradeResult } from '../trades';
-import { authenticateAccounts, authenticateUser } from './client';
+import { authenticateAccounts, authenticateUser, TradeLockerAuthError } from './client';
 import { TradeLockerConnection, TradeLockerSubscribeError } from './connection';
 import {
 	CLOSE_TOPUP_MAX_RETRIES,
@@ -279,6 +279,28 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnAppli
 			}
 			session.connection = undefined;
 
+			if (error instanceof TradeLockerAuthError && error.fatal) {
+				// Credentials/account rejected by the broker (400/401/403) — retrying every backoff tick
+				// would hammer a dead login forever (and risk broker-side lockout for the whole login
+				// group). Stamp the account 'deactivated' — the role the main app's cron used to fill —
+				// so loadAccounts stops returning it and the next reconcile tears the session down.
+				// Reconnecting the terminal in the UI resets the status.
+				this.logger.warn(
+					`[${account.accountId}] login rejected (HTTP ${error.status}) — deactivating integration: ${error.message}`
+				);
+				Sentry.captureMessage('TradeLocker worker deactivated: auth/account invalid', {
+					level: 'warning',
+					fingerprint: ['tradelocker-worker-auth-invalid'],
+					extra: { accountId: account.accountId, tradingAccountId: account.tradingAccountId },
+				});
+				if (!(await this.deactivateAccount(account))) {
+					// Stamp failed (DB blip) — keep the backoff loop alive so the next fatal auth error
+					// retries the stamp; otherwise the session sits half-dead until a restart.
+					this.scheduleReconnect(session);
+				}
+				return;
+			}
+
 			if (error instanceof TradeLockerSubscribeError && error.fatal) {
 				this.logger.error(
 					`[${account.accountId}] SUBSCRIBE rejected (${error.code}) — not reconnecting: ${error.message}`
@@ -514,6 +536,18 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnAppli
 			this.logger.log(
 				`[${session.account.accountId}] backfilled ${written} closed trade(s) from REST`
 			);
+		}
+		// Keep the main app's 'Last sync' surfaces honest: the cron used to stamp this on every pass,
+		// and with it disabled the worker's completed close-scan (SyncEnd or the 3-min periodic net) is
+		// the equivalent heartbeat — without it every UI label would show an ever-aging date while the
+		// data is actually live. Best-effort: a failed stamp never fails the backfill.
+		try {
+			await this.prisma.tradingAccount.update({
+				where: { id: session.account.tradingAccountId },
+				data: { lastSyncAt: new Date() },
+			});
+		} catch (error) {
+			this.logger.warn(`[${session.account.accountId}] lastSyncAt stamp failed: ${describe(error)}`);
 		}
 	}
 
@@ -755,6 +789,25 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnAppli
 		}
 	}
 
+	/**
+	 * Stamp a dead-credential account 'deactivated' so loadAccounts stops returning it (the next
+	 * reconcile tears its session down) and the main app's admin surfaces count it. This is the role
+	 * the cron's auto-sync used to fill; the manual sync mutation still stamps it too. Mirrors the
+	 * cTrader side's deactivateDeadToken.
+	 */
+	private async deactivateAccount(account: ManagedAccount): Promise<boolean> {
+		try {
+			await this.prisma.tradingAccount.update({
+				where: { id: account.tradingAccountId },
+				data: { terminalIntegrationStatus: 'deactivated' },
+			});
+			return true;
+		} catch (error) {
+			this.logger.error(`[${account.accountId}] failed to mark deactivated: ${describe(error)}`);
+			return false;
+		}
+	}
+
 	private async loadAccounts(): Promise<ManagedAccount[]> {
 		const onlyUsers = this.config
 			.get('TRADELOCKER_ONLY_USER_IDS', { infer: true })
@@ -790,11 +843,16 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnAppli
 
 		const accounts: ManagedAccount[] = [];
 		for (const row of rows) {
-			// 'deactivated' = TradeLocker auth/account no longer valid. Active is null OR any other value.
-			// Filtered in code (not the query) because Prisma's `{ not: 'deactivated' }` drops NULL rows —
-			// SQL three-valued logic: `NULL != 'deactivated'` is NULL, not true — which would exclude
-			// every active (null-status) account.
-			if (row.terminalIntegrationStatus === 'deactivated') {
+			// 'deactivated' = TradeLocker auth/account no longer valid. 'paused_inactive' = the owner has
+			// been idle >30 days — stamped nightly by the main app's deactivate-stale-accounts cron and
+			// cleared by heartbeat the moment the user returns (reconcile then picks the account back up
+			// within a tick). Active is null OR any other value. Filtered in code (not the query) because
+			// Prisma's `{ not: ... }` drops NULL rows — SQL three-valued logic: `NULL != x` is NULL, not
+			// true — which would exclude every active (null-status) account.
+			if (
+				row.terminalIntegrationStatus === 'deactivated' ||
+				row.terminalIntegrationStatus === 'paused_inactive'
+			) {
 				continue;
 			}
 			const creds = row.terminalCredentials;
