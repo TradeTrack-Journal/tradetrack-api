@@ -6,6 +6,7 @@ import { SentryGlobalFilter, SentryModule } from '@sentry/nestjs/setup';
 import { validateEnv } from './config';
 import { CtraderModule } from './ctrader';
 import { HealthModule } from './health';
+import { MetaApiModule } from './metaapi';
 import { PrismaModule } from './prisma';
 import { TradeLockerModule } from './tradelocker';
 
@@ -21,6 +22,7 @@ import { TradeLockerModule } from './tradelocker';
 		PrismaModule,
 		HealthModule,
 		CtraderModule,
+		MetaApiModule,
 		TradeLockerModule,
 	],
 	providers: [

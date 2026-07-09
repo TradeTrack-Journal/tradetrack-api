@@ -53,6 +53,21 @@ const envSchema = z.object({
 	TRADELOCKER_POC_SERVER: z.string().optional(),
 	TRADELOCKER_POC_ENVIRONMENT: z.enum(['demo', 'live']).optional(),
 	TRADELOCKER_POC_ACCOUNT_ID: z.string().optional(),
+
+	// MetaApi (MT5 realtime sync). Optional so the service degrades gracefully (warn + idle) when
+	// absent. The token is a server-side secret with scopes trading-account-management-api,
+	// metaapi-rpc-api and metaapi-real-time-streaming-api. It EXPIRES — a 401 is a token failure that
+	// affects every account at once and must never deactivate a trading account.
+	METAAPI_TOKEN: z.string().optional(),
+	// Master switch. The connection manager stays idle unless this is exactly 'true'. Keep it off until
+	// the integration is verified: createAccount deploys the account and bills a 6-hour minimum.
+	METAAPI_LIVE_SYNC_ENABLED: z.string().optional(),
+	// Optional MetaApi region hint passed to createAccount.
+	METAAPI_REGION: z.string().optional(),
+	// Staged-rollout / test scope: comma-separated user ids whose MetaApi accounts the worker manages
+	// exclusively (mirrors CTRADER_ONLY_USER_IDS). Read via process.env in the connection manager — it
+	// MUST be declared here, otherwise Zod strips it and it never reaches process.env.
+	METAAPI_ONLY_USER_IDS: z.string().optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;
