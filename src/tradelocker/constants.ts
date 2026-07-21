@@ -55,6 +55,14 @@ export const CONNECT_TIMEOUT_MS = 15_000;
 export const RECONNECT_BASE_DELAY_MS = 1_000;
 export const RECONNECT_MAX_DELAY_MS = 60_000;
 
+/**
+ * Consecutive failed connect attempts before ONE Sentry event is sent for the outage. Transient
+ * blips (slow SUBSCRIBE acks, socket timeouts, broker restarts) self-heal via backoff within a
+ * couple of attempts and stay log-only; a genuine persistent outage crosses this and reports once —
+ * the counter resets on the next successful connect.
+ */
+export const CONNECT_FAILURES_SENTRY_THRESHOLD = 5;
+
 /** How often to reconcile live sessions with the DB (pick up newly connected / removed accounts). */
 export const RECONCILE_INTERVAL_MS = 30_000;
 

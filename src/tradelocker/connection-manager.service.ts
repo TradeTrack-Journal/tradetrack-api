@@ -10,6 +10,7 @@ import { authenticateAccounts, authenticateUser, TradeLockerAuthError } from './
 import { TradeLockerConnection, TradeLockerSubscribeError } from './connection';
 import {
 	CLOSE_TOPUP_MAX_RETRIES,
+	CONNECT_FAILURES_SENTRY_THRESHOLD,
 	HISTORY_MAX_PAGES,
 	HISTORY_PAGE_LIMIT,
 	OPEN_PNL_UPDATE_INTERVAL_MS,
@@ -305,12 +306,41 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnAppli
 				this.logger.error(
 					`[${account.accountId}] SUBSCRIBE rejected (${error.code}) — not reconnecting: ${error.message}`
 				);
-				Sentry.captureException(error);
+				// Permanent config/entitlement rejection (e.g. a white-label brand host the streams
+				// developer key doesn't cover — "Host: bsb.tradelocker.com not recognized"). Nothing
+				// retries until the next deploy, but every boot used to captureException a fresh
+				// event per account — fingerprint into ONE warning issue per rejection code instead.
+				Sentry.captureMessage('TradeLocker SUBSCRIBE rejected fatally', {
+					level: 'warning',
+					fingerprint: ['tradelocker-subscribe-fatal', error.code],
+					extra: {
+						accountId: account.accountId,
+						tradingAccountId: account.tradingAccountId,
+						code: error.code,
+						reason: error.message,
+					},
+				});
 				return;
 			}
 
-			this.logger.error(`[${account.accountId}] connect failed: ${describe(error)}`);
-			Sentry.captureException(error);
+			// Transient connect-path failures (slow SUBSCRIBE acks, socket connect timeouts, xhr poll
+			// errors) self-heal via the backoff below; per-attempt captureException flooded Sentry with
+			// hundreds of events. Every attempt stays in logs; Sentry gets ONE fingerprinted event per
+			// outage — at the attempt where the failure turns persistent. Success resets the counter.
+			const failedAttempts = session.reconnectAttempt + 1;
+			this.logger.error(
+				`[${account.accountId}] connect failed (attempt ${failedAttempts}): ${describe(error)}`
+			);
+			if (failedAttempts === CONNECT_FAILURES_SENTRY_THRESHOLD) {
+				Sentry.captureException(error, {
+					fingerprint: ['tradelocker-connect-persistent'],
+					extra: {
+						accountId: account.accountId,
+						tradingAccountId: account.tradingAccountId,
+						failedAttempts,
+					},
+				});
+			}
 			this.scheduleReconnect(session);
 		}
 	}
