@@ -6,6 +6,20 @@ Guidance for Claude Code when working in this repository.
 region `fra`). It keeps live cTrader Open API connections and writes deals into the same
 Neon Postgres as the main app (`traders-notetaker`).
 
+## Deployment — push to main IS a production deploy
+
+- **Every push to `main` auto-deploys to Fly.io production** via
+  `.github/workflows/deploy.yml` (`flyctl deploy --remote-only`, concurrency-cancelled per
+  branch). There is no staging environment and no manual approval step.
+- Therefore: commit to `main` only work that is ready to run in production. Half-done work
+  goes on a branch. A push that breaks the build fails the Action (prod keeps the previous
+  machine image), but a push that builds and misbehaves at runtime WILL go live.
+- No manual `fly deploy` is needed after pushing. Manual deploys are only for emergencies
+  (Actions down) — and note the historical gotcha: the Depot builder has been flaky here,
+  `fly deploy --remote-only --depot=false` was the working fallback.
+- Secrets are managed with `fly secrets`, not the workflow; the workflow only injects
+  `SENTRY_AUTH_TOKEN` as a build secret for sourcemap upload when configured.
+
 ## Testing
 
 - **Do not write tests.** No unit tests, no e2e tests — do not add new test files or expand
