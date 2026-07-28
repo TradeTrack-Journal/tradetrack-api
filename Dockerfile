@@ -41,6 +41,12 @@ COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/package.json ./package.json
 
+# metaapi.cloud-sdk keeps a local history db at `${cwd}/.metaapi` and mkdir's it on the FIRST
+# streaming connect. /app is root-owned while the process runs as `node`, so without this the mkdir
+# throws EACCES, every connect fails, and the worker loops creating (and billing) cloud accounts it
+# can never stream from. Ephemeral per release, which is fine — our own backfill owns history.
+RUN mkdir -p /app/.metaapi && chown node:node /app/.metaapi
+
 USER node
 EXPOSE 8080
 CMD ["node", "dist/main.js"]

@@ -476,9 +476,25 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnModul
 				this.logger.error(
 					`METAAPI_TOKEN rejected while tearing down ${tradingAccountId} — the cloud terminal is STILL DEPLOYED and billing. Rotate the token; the next reconcile retries.`
 				);
-			} else {
-				this.logger.error(`teardown failed for ${tradingAccountId}`, error as Error);
+				return false;
 			}
+
+			// The REST delete can SUCCEED with the throw happening afterwards — observed live: the SDK's
+			// remove() deletes the cloud account, then its local history cleanup threw EACCES. Reporting
+			// false then would be a lie with an expensive consequence: the row stays visible, the
+			// not-found path clears the id, and the connect loop creates (and bills) a fresh doomed
+			// account every cycle. Probe once: if the account is gone, the teardown DID succeed.
+			try {
+				await api.metatraderAccountApi.getAccount(cloudId);
+			} catch (probeError) {
+				if (classifyMetaApiError(probeError) === 'not-found') {
+					this.logger.log(
+						`cloud account ${cloudId} is gone despite the teardown error — treating as done`
+					);
+					return true;
+				}
+			}
+			this.logger.error(`teardown failed for ${tradingAccountId}`, error as Error);
 			return false;
 		}
 	}
@@ -496,6 +512,31 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnModul
 		}
 
 		if (kind === 'not-found') {
+			// An initial connect that already exhausted its attempts must NOT clear-and-recreate: that is
+			// the exact loop that burned money when every connect failed for an environmental reason —
+			// each cycle created a fresh cloud account (6h minimum billing), failed, deleted it, and
+			// started over. Finalize instead; the user can reconnect once the cause is fixed.
+			const attempts = this.backoff.get(account.tradingAccountId) ?? 0;
+			if (account.status === STATUS.connecting && attempts >= CONNECT_MAX_ATTEMPTS) {
+				this.logger.error(
+					`giving up initial connect for ${account.tradingAccountId} — cloud account vanished after ${attempts} failed attempts`
+				);
+				this.backoff.delete(account.tradingAccountId);
+				await this.prisma.tradingAccount.update({
+					where: { id: account.tradingAccountId },
+					data: {
+						terminalAccountId: null,
+						terminalIntegrationStatus: STATUS.deactivated,
+						autoSyncEnabled: false,
+						terminalSyncState: this.mergeSyncState(account, {
+							lastError: CONNECT_FAILED_MESSAGE,
+							deployedAt: null,
+						}),
+					},
+				});
+				return;
+			}
+
 			// The stored id points at a cloud account that no longer exists. Clear it and let the next
 			// reconcile re-adopt by name or create afresh. Not the account's fault; do not deactivate.
 			this.logger.warn(
