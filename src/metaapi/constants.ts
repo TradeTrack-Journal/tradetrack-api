@@ -33,6 +33,19 @@ export const RECONNECT_BASE_DELAY_MS = 1_000;
 export const RECONNECT_MAX_DELAY_MS = 60_000;
 
 /**
+ * How many times to retry the INITIAL connect before giving up. With the backoff schedule
+ * (1,2,4,8,16,32,60,60s) this is ~3 minutes — long enough for a valid account's broker connection and
+ * MetaApi's broker-settings detection, but bounded so a wrong password / inactive account does not
+ * bill a deployed terminal forever behind an eternal "Connecting…". Only applies while the account is
+ * still 'connecting'; a LIVE account that merely drops reconnects indefinitely, like ctrader.
+ */
+export const CONNECT_MAX_ATTEMPTS = 8;
+
+/** Stored in terminalSyncState.lastError and shown in the UI when the initial connect gives up. */
+export const CONNECT_FAILED_MESSAGE =
+	'Could not connect to the broker. Check the account password (use the read-only investor password, not the EA sync token) and the server name, and make sure the account is active.';
+
+/**
  * Deterministic cloud-account name. This — not login+server — is how we recognise an account as ours.
  * Matching on login+server would adopt an account belonging to another TradingAccount row (two rows can
  * carry the same MT5 login) or to another app sharing the MetaApi token.

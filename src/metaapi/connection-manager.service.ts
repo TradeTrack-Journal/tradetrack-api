@@ -10,6 +10,8 @@ import { BackfillService } from './backfill.service';
 import { classifyMetaApiError } from './client';
 import {
 	accountName,
+	CONNECT_FAILED_MESSAGE,
+	CONNECT_MAX_ATTEMPTS,
 	LIVE_STATES,
 	RECONCILE_INTERVAL_MS,
 	RECONNECT_BASE_DELAY_MS,
@@ -535,6 +537,41 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnModul
 
 		const attempts = (this.backoff.get(account.tradingAccountId) ?? 0) + 1;
 		this.backoff.set(account.tradingAccountId, attempts);
+
+		// An account still in its INITIAL connect that keeps failing is almost never a passing blip —
+		// it is a wrong password, an inactive/expired account, or a server that never authenticates.
+		// MetaApi surfaces "not connected to broker" as a TimeoutError (no fatal code), so without this
+		// bound the worker would retry — and bill a deployed terminal — forever behind an eternal
+		// "Connecting…". A LIVE account (status === null) that merely dropped keeps retrying, like cTrader.
+		if (account.status === STATUS.connecting && attempts >= CONNECT_MAX_ATTEMPTS) {
+			this.logger.error(
+				`giving up initial connect for ${account.tradingAccountId} after ${attempts} attempts`,
+				error as Error
+			);
+			// Stop the meter BEFORE writing a status that hides the row, or the terminal bills on unreachable.
+			if (account.metaApiAccountId) {
+				const destroyed = await this.destroyCloudAccount(
+					account.tradingAccountId,
+					account.metaApiAccountId
+				);
+				if (!destroyed) return; // still billing (e.g. token 401) — stay visible, retry next reconcile
+			}
+			this.backoff.delete(account.tradingAccountId);
+			await this.prisma.tradingAccount.update({
+				where: { id: account.tradingAccountId },
+				data: {
+					terminalAccountId: null,
+					terminalIntegrationStatus: STATUS.deactivated,
+					autoSyncEnabled: false,
+					terminalSyncState: this.mergeSyncState(account, {
+						lastError: CONNECT_FAILED_MESSAGE,
+						deployedAt: null,
+					}),
+				},
+			});
+			return;
+		}
+
 		const delay = Math.min(RECONNECT_BASE_DELAY_MS * 2 ** (attempts - 1), RECONNECT_MAX_DELAY_MS);
 		this.logger.warn(
 			`transient failure for ${account.tradingAccountId} (attempt ${attempts}), retrying in ${delay}ms`
