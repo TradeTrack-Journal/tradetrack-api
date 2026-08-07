@@ -3,6 +3,7 @@ import { ConfigModule } from '@nestjs/config';
 import { APP_FILTER } from '@nestjs/core';
 import { SentryGlobalFilter, SentryModule } from '@sentry/nestjs/setup';
 
+import { CandlesModule } from './candles';
 import { validateEnv } from './config';
 import { CtraderModule } from './ctrader';
 import { HealthModule } from './health';
@@ -24,6 +25,7 @@ import { TradeLockerModule } from './tradelocker';
 		CtraderModule,
 		MetaApiModule,
 		TradeLockerModule,
+		CandlesModule,
 	],
 	providers: [
 		// Catches exceptions thrown in routes/handlers and forwards them to Sentry. Since there is no

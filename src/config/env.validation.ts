@@ -68,6 +68,19 @@ const envSchema = z.object({
 	// exclusively (mirrors CTRADER_ONLY_USER_IDS). Read via process.env in the connection manager — it
 	// MUST be declared here, otherwise Zod strips it and it never reaches process.env.
 	METAAPI_ONLY_USER_IDS: z.string().optional(),
+
+	// Candle ingest (replay/backtest history from Dukascopy's S3 archive). Master switch for the
+	// ingest worker (Phase 3+): the worker stays idle unless this is exactly 'true'.
+	CANDLE_INGEST_ENABLED: z.string().optional(),
+	// Read-only AWS credentials for the requester-pays bucket (standard SDK names so the AWS
+	// default credential chain picks them up). Optional so the service degrades gracefully
+	// (warn + idle) when absent. MUST be declared here even though the SDK reads process.env,
+	// otherwise Zod strips them from the validated config (mirrors CTRADER_ONLY_USER_IDS).
+	AWS_ACCESS_KEY_ID: z.string().optional(),
+	AWS_SECRET_ACCESS_KEY: z.string().optional(),
+	// Escape hatches should Dukascopy ever move the archive; defaults in candles/constants.ts.
+	DUKASCOPY_S3_BUCKET: z.string().optional(),
+	DUKASCOPY_S3_REGION: z.string().optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;
