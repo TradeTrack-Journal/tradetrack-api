@@ -48,6 +48,9 @@ model User {
   plan                   UserPlan                @default(FREE)
   completedTours         String[]                @default([])
   trackerOnboardedAt     DateTime?
+  firstStepsDismissedAt  DateTime?
+  /** First time the server served this user an *unfinished* First steps checklist. Null plus a 5/5 derivation means the user had already done everything before the widget existed, so they are opted out silently instead of being congratulated. */
+  firstStepsSeenAt       DateTime?
   createdAt              DateTime                @default(now())
   updatedAt              DateTime                @updatedAt
   trades                 Trade[]
@@ -55,9 +58,11 @@ model User {
   sessions               Session[]
   tradingAccounts        TradingAccount[]
   accountCashFlows       AccountCashFlow[]
+  commissionRules        CommissionRule[]
   tradingSessions        TradingSession[]
   backtests              Backtest[]
   backtestTrades         BacktestTrade[]
+  replaySessions         ReplaySession[]
   biasTools              BiasTool[]
   poiTools               PoiTool[]
   itfTools               ItfConfirmationTool[]
@@ -114,6 +119,40 @@ model User {
   terminalImportFailures TerminalImportFailure[]
   aiResponseFeedback     AiResponseFeedback[]
   activityEvents         UserActivityEvent[]
+  edgeFindings           EdgeFinding[]
+  healthCheckRuns        HealthCheckRun[]
+  aiMistakeRuns          AiMistakeRun[]
+  aiMistakeRejections    AiMistakeRejection[]
+  insightsCoachMemories  InsightsCoachMemory[]
+}
+
+/**
+ * Tombstone of an AI-found mistake the user deleted. Without it a checkpoint reset
+ * (notes edit) would let the next scan re-create the very mistake the user rejected.
+ */
+model AiMistakeRejection {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tradeId     String
+  trade       Trade    @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  /** Lowercased trimmed title — seeds the title dedupe of future scans. */
+  titleKey    String
+  /** Normalized evidence quote (evidenceDedupeKey) — seeds the evidence dedupe. */
+  evidenceKey String?
+  /**
+   * Snapshot of the rejected mistake for the rejection-learning loop (the error row is
+   * gone by the time patterns are aggregated): its type and the confidence the model had.
+   * knownKey is the locale-stable pattern identity — localized titles drift between runs.
+   */
+  category     String?
+  customTypeId String?
+  aiConfidence Float?
+  knownKey     String?
+  createdAt   DateTime @default(now())
+
+  @@index([tradeId])
+  @@index([userId])
 }
 
 model UserActivityEvent {
@@ -235,6 +274,7 @@ model TradingAccount {
   user                    User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
   trades                  Trade[]
   cashFlows               AccountCashFlow[]
+  commissionRules         CommissionRule[]
   /** which terminal the user uses for this account (mt5 | tradelocker | ctrader | custom name); for display and add-trades flow */
   preferredTerminal       String?
   terminalType            String?
@@ -243,7 +283,9 @@ model TradingAccount {
   terminalServer          String?
   terminalEnvironment     String?
   terminalConnectedAt     DateTime?
-  /** 'deactivated' when TradeLocker auth/account no longer valid (e.g. prop company disabled demo); null = active */
+  /** TradeLocker integration status: null = active; 'deactivated' = auth/account no longer valid
+   *  (e.g. prop company disabled demo — needs reconnect); 'paused_inactive' = reversible idle pause set
+   *  by the deactivate-stale-accounts cron, cleared on the owner's return (reactivateTradelockerOnReturn) */
   terminalIntegrationStatus String?
   lastSyncAt              DateTime?
   autoSyncEnabled         Boolean              @default(false)
@@ -277,6 +319,28 @@ model AccountCashFlow {
   amount           Float
   occurredAt       DateTime
   note             String?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  @@index([tradingAccountId])
+  @@index([userId])
+}
+
+/// Default commission applied to NEW manual trades on an account (fill-only-when-missing:
+/// never overrides broker-imported or manually entered fees). `amount` is a positive cost in
+/// the account currency; the stored Trade.commission gets the broker sign (negative).
+/// `symbol` narrows the rule to one instrument; null = the account-wide fallback rule.
+model CommissionRule {
+  id               String         @id @default(cuid())
+  tradingAccountId String
+  tradingAccount   TradingAccount @relation(fields: [tradingAccountId], references: [id], onDelete: Cascade)
+  userId           String
+  user             User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /** 'perTrade' | 'perLot' — perLot multiplies by the trade quantity */
+  mode             String
+  amount           Float
+  /** uppercase instrument filter; null = all symbols on the account */
+  symbol           String?
   createdAt        DateTime       @default(now())
   updatedAt        DateTime       @updatedAt
 
@@ -339,6 +403,8 @@ model Trade {
   tradingSessionId      String?
   tradingSession        TradingSession?            @relation(fields: [tradingSessionId], references: [id], onDelete: SetNull)
   riskPercentage        Float?
+  /** true = riskPercentage є дефолтом імпортера, а не вводом користувача. Детектори поведінки ризику ігнорують такі трейди. */
+  riskPercentageIsDefault Boolean                  @default(true)
   rr                    Float?                     @map("expectedRR")
   result                String?
   followedPlan          Boolean?                   @default(false)
@@ -392,9 +458,14 @@ model Trade {
   ruleSet               RuleSet?                   @relation(fields: [ruleSetId], references: [id], onDelete: SetNull)
   tradeRuleItems        TradeRuleItem[]
   isTestTrade           Boolean                    @default(false)
+  /** Checkpoint of the AI mistake analysis — set once the trade has been scanned so reruns stay incremental. */
+  aiMistakeAnalyzedAt   DateTime?
+  /** Run that stamped the checkpoint — undo resets exactly this run's trades, no time heuristics. */
+  aiMistakeAnalyzedByRunId String?
   createdAt             DateTime                   @default(now())
   updatedAt             DateTime                   @updatedAt
   tradeErrors           TradeError[]
+  aiMistakeRejections   AiMistakeRejection[]
 
   @@index([userId])
   @@index([userId, symbol])
@@ -402,6 +473,7 @@ model Trade {
   @@index([userId, entryDate]) // composite index for sorted user queries (critical for performance)
   @@index([userId, tradingAccountId, entryDate]) // multi-account + date-range statistics filtering
   @@index([tradingAccountId])
+  @@index([aiMistakeAnalyzedByRunId])
   @@index([tradingSessionId])
   @@index([biasToolId])
   @@index([poiToolId])
@@ -411,6 +483,7 @@ model Trade {
   @@index([ftaToolId])
   @@index([targetToolId])
   @@index([tradingSetupId])
+  @@index([userId, tradingSetupId]) // "does this user have any trade linked to a strategy?" — without it the existence probe scans every trade the user owns whenever the answer is no
   @@index([ruleSetId])
   @@unique([userId, terminalName, terminalTradeId], name: "userId_terminalName_terminalTradeId")
 }
@@ -462,6 +535,8 @@ model RuleItem {
   title          String
   description    String?          @db.Text
   showWhen       RuleItemShowWhen @default(ALWAYS)
+  /** Breaking a mandatory rule counts as a trading mistake; optional rules are guidance only. */
+  mandatory      Boolean          @default(true)
   sortOrder      Int              @default(0)
   createdAt      DateTime         @default(now())
   tradeRuleItems TradeRuleItem[]
@@ -617,12 +692,22 @@ model TradeError {
   customType       UserMistakeType? @relation(fields: [customTypeId], references: [id], onDelete: SetNull)
   description      String           @db.Text
   chartDescription String           @db.Text
+  /** 'user' | 'ai' — who created the mistake record. */
+  source           String           @default("user")
+  aiRunId          String?
+  aiRun            AiMistakeRun?    @relation(fields: [aiRunId], references: [id], onDelete: SetNull)
+  aiConfidence     Float?
+  /** Verbatim evidence quote the AI backed this mistake with — dedupe key across re-scans. */
+  aiEvidence       String?          @db.Text
+  /** Canonical English catalog key of the mistake (locale-stable identity for learning). */
+  aiKnownKey       String?
   createdAt        DateTime         @default(now())
   updatedAt        DateTime         @updatedAt
 
   @@index([userId])
   @@index([tradeId])
   @@index([customTypeId])
+  @@index([aiRunId])
 }
 
 model UserMistakeType {
@@ -636,6 +721,30 @@ model UserMistakeType {
 
   @@unique([userId, name])
   @@index([userId])
+}
+
+model AiMistakeRun {
+  id                   String       @id @default(cuid())
+  userId               String
+  user                 User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /** 'running' | 'completed' | 'partial' | 'failed' | 'cancelled' | 'undone' */
+  status               String       @default("running")
+  tradesTotal          Int          @default(0)
+  tradesProcessed      Int          @default(0)
+  mistakesCreated      Int          @default(0)
+  typesCreated         Int          @default(0)
+  reclassified         Int          @default(0)
+  /** Ids of pre-existing untyped TradeErrors this run assigned a type to — undo resets them to untyped. */
+  reclassifiedErrorIds String[]
+  /** Ids of UserMistakeTypes this run created — undo deletes them when no references remain. */
+  createdTypeIds       String[]
+  error                String?
+  createdAt            DateTime     @default(now())
+  updatedAt            DateTime     @updatedAt
+  finishedAt           DateTime?
+  tradeErrors          TradeError[]
+
+  @@index([userId, createdAt])
 }
 
 model BiasTool {
@@ -848,11 +957,52 @@ model Backtest {
   userId         String
   user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
   trades         BacktestTrade[]
+  replaySessions ReplaySession[]
   createdAt      DateTime        @default(now())
   updatedAt      DateTime        @updatedAt
 
   @@index([userId])
   @@index([tradingSetupId])
+}
+
+model ReplaySession {
+  id              String   @id @default(cuid())
+  backtestId      String
+  backtest        Backtest @relation(fields: [backtestId], references: [id], onDelete: Cascade)
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  symbol          String
+  timeframe       String
+
+  startTime       DateTime
+  /// Cursor ceiling chosen at setup. Null = "replay forward up to the present", which is resolved
+  /// against the clock of whoever opens the session — so it must stay null rather than be baked in.
+  endTime         DateTime?
+  lookbackStart   DateTime
+  cursorTime      DateTime
+  /// The replay clock: the last instant revealed, i.e. the CLOSE of the bar at `cursorTime`. Unlike
+  /// cursorTime it is timeframe-independent, so it is what a resume must restore — rebuilding it
+  /// from cursorTime would need the timeframe the user was on and would reintroduce the rounding
+  /// that used to throw away progress on every timeframe switch.
+  revealedThrough DateTime?
+
+  startingBalance Float
+  balance         Float
+  speed           Float    @default(1)
+  status          String   @default("active")
+
+  drawings        Json?
+  openPositions   Json?
+  pendingOrders   Json?
+
+  trades          BacktestTrade[]
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([userId])
+  @@index([backtestId])
 }
 
 model BacktestTrade {
@@ -876,13 +1026,28 @@ model BacktestTrade {
   followedPlan   Boolean?  @default(false)
   notes          String?   @db.Text
   analysisNotes  String?   @db.Text
+  entryPrice      Float?
+  exitPrice       Float?
+  quantity        Float?
+  stopLoss        Float?
+  takeProfit      Float?
+  orderType       String?
+  replaySessionId String?
+  replaySession   ReplaySession? @relation(fields: [replaySessionId], references: [id], onDelete: SetNull)
+  /// Replay-only: the id the client already assigned this trade, so a retried record is recognised
+  /// as the same trade instead of creating a duplicate row and counting its pnl twice. Null for
+  /// every other trade source (manual entry, statement import), and NULLs don't collide in the
+  /// unique index below.
+  clientTradeId   String?
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
 
+  @@unique([replaySessionId, clientTradeId])
   @@index([userId])
   @@index([backtestId])
   @@index([date])
   @@index([tradingSessionId])
+  @@index([replaySessionId])
 }
 
 model UserTablePreference {
@@ -1082,6 +1247,8 @@ model PendingMt5Account {
   server      String
   company     String?
   currency    String?
+  /** Account balance reported by the EA; prefills the nominal in the approve card. */
+  balance     Float?
   firstSeenAt DateTime @default(now())
   lastSeenAt  DateTime @default(now())
 
@@ -1205,6 +1372,12 @@ model TradingSetup {
   isPublic      Boolean  @default(false)
   shareId       String?  @unique
   shareAllowCopy Boolean @default(true)
+
+  // Public catalog (see docs/superpowers/specs/2026-07-22-public-strategies-design.md)
+  publishedAt          DateTime?
+  publicShowMoney      Boolean   @default(false)
+  publicStats          Json?
+  publicStatsUpdatedAt DateTime?
 
   userId    String
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -1406,6 +1579,8 @@ model BlogPost {
   /** optional key to group translations of the same article across locales */
   translationKey  String?
   title           String
+  /** optional ≤60-char SEO title used for the document <title>; falls back to `title` when null */
+  seoTitle        String?
   metaDescription String?   @db.Text
   content         String    @db.Text
   coverImageUrl   String?   @db.Text
@@ -1417,4 +1592,151 @@ model BlogPost {
   @@index([slug])
   @@index([locale, publishedAt])
   @@index([translationKey])
+}
+
+/// Permanent L3 cache of immutable historical replay candles (behind mem + Redis).
+/// One row per (symbol, resolution, bucket); bucket granularity matches the Dukascopy file layout
+/// (m -> day, h -> month, d -> year). Read only on a Redis miss, so DB load stays negligible; the
+/// JSON payload is auto-compressed by Postgres TOAST. The composite id makes duplicate buckets impossible.
+model CandleChunk {
+  symbol      String
+  resolution  String
+  bucketStart DateTime
+  candles     String   @db.Text
+  candleCount Int
+  source      String   @default("dukascopy")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@id([symbol, resolution, bucketStart])
+}
+
+enum CandleIngestJobStatus {
+  PENDING
+  RUNNING
+  DONE
+  FAILED
+}
+
+// Work queue for the backend candle-ingest worker (tradetrack-api). One row = one missing
+// CandleChunk bucket to fetch from the Dukascopy S3 archive. Enqueued by the main app on a
+// chunk miss (createMany + skipDuplicates on the natural key), polled by the backend worker.
+// Same natural key as CandleChunk so "job for this chunk" is unambiguous.
+model CandleIngestJob {
+  symbol      String
+  resolution  String
+  bucketStart DateTime
+  status      CandleIngestJobStatus @default(PENDING)
+  attempts    Int                   @default(0)
+  lastError   String?
+  createdAt   DateTime              @default(now())
+  updatedAt   DateTime              @updatedAt
+
+  @@id([symbol, resolution, bucketStart])
+  @@index([status, createdAt])
+}
+
+enum EdgeFindingStatus {
+  OPEN
+  IMPROVED
+  UNCHANGED
+  WORSE
+  DISMISSED
+  STALE
+}
+
+model EdgeFinding {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  detectorId    String
+  scopeKey      String
+  engineVersion Int
+
+  /// Популяція, на якій поміряно базлайн: 'all' або відсортовані id акаунтів через кому.
+  /// Верифікація МУСИТЬ читати ту саму популяцію (population integrity, ревʼю Task 9).
+  accountsKey String   @default("all")
+  accountIds  String[] @default([])
+
+  metricKey     String
+  baselineValue Decimal  @db.Decimal(18, 6)
+  baselineN     Int
+  requiredN     Int
+  windowStartAt DateTime
+
+  observedValue Decimal? @db.Decimal(18, 6)
+  observedN     Int      @default(0)
+  /// Усі виміряні угоди після windowStartAt (не лише в зрізі) — прогрес треку уникнення:
+  /// «перестав торгувати понеділки» теж має доходити до вердикту, інакше 0/30 висить вічно.
+  observedTotalN Int @default(0)
+
+  status     EdgeFindingStatus
+  verifiedAt DateTime?
+
+  severity     Int
+  /// Стовп перевірки: 'risk' | 'psychology' | 'execution' | 'consistency' | 'cost' | 'edge'.
+  /// Дефолт 'consistency' — усі наявні рядки створені бакетними/звичковими детекторами.
+  pillar String @default("consistency")
+  /// 'critical' | 'warning'. Дефолт 'critical' зберігає нинішню поведінку старих рядків.
+  level  String @default("critical")
+  /// Evidence[] — клікабельні докази під карткою. null для рядків, створених до Фази 0.
+  evidence Json?
+  costR        Decimal? @db.Decimal(12, 4)
+  costMoney    Decimal? @db.Decimal(18, 2)
+  costCurrency String?
+
+  facts          Json
+  narrative      String? @db.Text
+  narrativeModel String?
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  dismissedAt DateTime?
+
+  @@unique([userId, detectorId, scopeKey, accountsKey, windowStartAt])
+  @@index([userId, status])
+  @@index([userId, accountsKey])
+}
+
+/// Остання «сесія коучингу» — памʼять наративу між генераціями. Одна на користувача:
+/// наступна генерація отримує попередній текст і зобовʼязана визнати прогрес/регрес,
+/// а не знайомитися заново.
+model InsightsCoachMemory {
+  id      String @id @default(cuid())
+  userId  String
+  user    User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  surface String @default("insights")
+
+  narrative   String   @db.Text
+  filterHash  String
+  generatedAt DateTime
+  updatedAt   DateTime @updatedAt
+
+  @@unique([userId, surface])
+}
+
+/// Один прогін Health Check по конкретному скоупі рахунків. Заміняє хак із
+/// InsightsCoachMemory під surface 'edge-run:<key>': дає і маркер часу запуску,
+/// і кеш вердикту, і історію для порівняння з минулим разом.
+model HealthCheckRun {
+  id             String    @id @default(cuid())
+  userId         String
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accountsKey    String
+  startedAt      DateTime  @default(now())
+  finishedAt     DateTime?
+  tradesAnalyzed Int       @default(0)
+  checksRun      Int       @default(0)
+  checksSkipped  Int       @default(0)
+  criticalCount  Int       @default(0)
+  warningCount   Int       @default(0)
+  goodCount      Int       @default(0)
+  verdictText    String?   @db.Text
+  verdictModel   String?
+  /// Хеш усіх результатів чеків — ключ кешу вердикту й озвучки.
+  factsHash      String?
+  createdAt      DateTime  @default(now())
+
+  @@index([userId, accountsKey, startedAt])
 }
