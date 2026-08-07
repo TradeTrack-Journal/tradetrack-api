@@ -2,7 +2,11 @@ import { Injectable, Logger, OnApplicationBootstrap, OnModuleDestroy } from '@ne
 import { ConfigService } from '@nestjs/config';
 import type { Prisma } from '@prisma/client';
 import MetaApi from 'metaapi.cloud-sdk';
-import type { MetatraderAccount } from 'metaapi.cloud-sdk';
+import type {
+	MetatraderAccount,
+	RpcMetaApiConnectionInstance,
+	StreamingMetaApiConnectionInstance,
+} from 'metaapi.cloud-sdk';
 
 import { decrypt } from '../crypto';
 import { PrismaService } from '../prisma';
@@ -233,6 +237,17 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnModul
 		 */
 		let resolved: ManagedAccount = account;
 
+		/**
+		 * Connections this attempt opened, for the failure path. The SDK registry refcounts instances
+		 * per account: an instance that is never close()d keeps the account's subscription retry loop
+		 * alive FOREVER — after the cloud account is later undeployed it spams "Failed to subscribe …
+		 * no accounts deployed yet" every 5 minutes (the SDK's retry cap) — and pins its listener,
+		 * terminal state and in-memory history storage. Accumulated across retries that is a memory
+		 * leak a 512MB machine cannot absorb.
+		 */
+		let rpcToClose: RpcMetaApiConnectionInstance | null = null;
+		let streamToClose: StreamingMetaApiConnectionInstance | null = null;
+
 		try {
 			const metaAccount = await this.ensureAccount(api, account);
 			resolved = { ...account, metaApiAccountId: metaAccount.id };
@@ -249,6 +264,7 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnModul
 			if (this.abandon(account.tradingAccountId, generation)) return;
 
 			const rpc = metaAccount.getRPCConnection();
+			rpcToClose = rpc;
 			await rpc.connect();
 			await rpc.waitSynchronized();
 			await this.backfill.run(rpc, resolved);
@@ -263,6 +279,7 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnModul
 				nominal: account.nominal,
 			};
 			const stream = metaAccount.getStreamingConnection();
+			streamToClose = stream;
 			stream.addSynchronizationListener(
 				new MetaApiSyncListener({
 					writer: this.writer,
@@ -312,6 +329,22 @@ export class ConnectionManagerService implements OnApplicationBootstrap, OnModul
 			this.logger.log(`streaming ${account.tradingAccountId} (metaapi ${metaAccount.id})`);
 		} catch (error) {
 			this.sessions.delete(account.tradingAccountId);
+			// Close BEFORE handleFailure: the give-up paths undeploy the cloud account, and the
+			// subscription must be gone by then or the SDK retries against a dead account forever.
+			// instance.close() also removes the listener this attempt added — without it every retry
+			// stacks one more listener on the registry-shared connection and each live deal is
+			// finalized (and RPC-fetched) once per past failure. Best effort: never mask the original
+			// failure with a close error.
+			try {
+				await streamToClose?.close();
+			} catch {
+				/* best effort */
+			}
+			try {
+				await rpcToClose?.close();
+			} catch {
+				/* best effort */
+			}
 			await this.handleFailure(resolved, error);
 		} finally {
 			this.opening.delete(account.tradingAccountId);
