@@ -44,6 +44,7 @@ export const INGEST_INSTRUMENT_BY_SYMBOL: Record<string, IngestInstrument> = {
 	XAUUSD: { s3Folder: 'XAUUSD', decimalFactor: 1e3 },
 	US30: { s3Folder: 'USA30IDXUSD', decimalFactor: 1e3 },
 	SPX500: { s3Folder: 'USA500IDXUSD', decimalFactor: 1e3 },
+	GER40: { s3Folder: 'DEUIDXEUR', decimalFactor: 1e3 },
 };
 
 /**
