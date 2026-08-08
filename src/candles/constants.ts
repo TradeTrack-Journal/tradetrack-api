@@ -33,7 +33,8 @@ export interface IngestInstrument {
  * The replay instrument set, keyed by the app-facing symbol used in CandleChunk/CandleIngestJob
  * rows. MUST stay in sync with the main app's REPLAY_INSTRUMENTS (BacktestReplay/constants) —
  * decimalFactor values were extracted from dukascopy-node 1.46.4's instrument metadata, since
- * a wrong scale corrupts every price silently.
+ * a wrong scale corrupts every price silently. The 2026-08-08 batch (NAS100…ADAUSD) was
+ * additionally verified by decoding real 2026-08-05 archive files and eyeballing the prices.
  */
 export const INGEST_INSTRUMENT_BY_SYMBOL: Record<string, IngestInstrument> = {
 	EURUSD: { s3Folder: 'EURUSD', decimalFactor: 1e5 },
@@ -45,6 +46,13 @@ export const INGEST_INSTRUMENT_BY_SYMBOL: Record<string, IngestInstrument> = {
 	US30: { s3Folder: 'USA30IDXUSD', decimalFactor: 1e3 },
 	SPX500: { s3Folder: 'USA500IDXUSD', decimalFactor: 1e3 },
 	GER40: { s3Folder: 'DEUIDXEUR', decimalFactor: 1e3 },
+	NAS100: { s3Folder: 'USATECHIDXUSD', decimalFactor: 1e3 },
+	USOIL: { s3Folder: 'LIGHTCMDUSD', decimalFactor: 1e3 },
+	GBPAUD: { s3Folder: 'GBPAUD', decimalFactor: 1e5 },
+	GBPJPY: { s3Folder: 'GBPJPY', decimalFactor: 1e3 },
+	// Crypto trades 24/7: Saturday files exist in the archive and ingest like any other day.
+	BTCUSD: { s3Folder: 'BTCUSD', decimalFactor: 1e1 },
+	ADAUSD: { s3Folder: 'ADAUSD', decimalFactor: 1e3 },
 };
 
 /**
