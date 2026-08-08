@@ -1039,6 +1039,9 @@ model BacktestTrade {
   /// every other trade source (manual entry, statement import), and NULLs don't collide in the
   /// unique index below.
   clientTradeId   String?
+  /// Auto-captured replay chart snapshot (Vercel Blob URL) taken as the trade was recorded —
+  /// the position grid/markers land on the trade page without manual screenshotting.
+  chartScreenshotUrl String?
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
 
